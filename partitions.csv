@@ -1,0 +1,7 @@
+# Name, Type, SubType, Offset, Size, Flags
+nvs, data, nvs, 0x9000, 0x6000,
+phy_init, data, phy, 0xf000, 0x1000,
+factory, app, factory, 0x10000, 6M,
+# Preserve the connected device's existing data partitions without mounting them.
+quota_accounts, data, nvs, 0x610000, 0x40000,
+calendar_cache, data, 0x40, 0x650000, 0x100000,

@@ -1,0 +1,18 @@
+menu "OAuth probe"
+    config OAUTH_PROBE_HTTP_PORT
+        int "Local account setup HTTP port"
+        range 1024 65535
+        default 8080
+        help
+            The random, short-lived setup URL is served on this port over the local Wi-Fi network.
+endmenu
+
+menu "Display diagnostics"
+    config CLAUDE_DISPLAY_DIAGNOSTIC
+        bool "Run raw RGB565 display test instead of the monitor"
+        default n
+        help
+            Temporary hardware test. Bypasses LVGL, Wi-Fi and OAuth, and does
+            not read or change saved credentials. Flash the normal firmware
+            again to return to the monitor.
+endmenu

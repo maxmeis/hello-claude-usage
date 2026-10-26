@@ -1,0 +1,16 @@
+.deps/
+.private/
+build*/
+sdkconfig
+sdkconfig.old
+main/provision.h
+__pycache__/
+*.py[cod]
+*.bin
+*.elf
+*.map
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
