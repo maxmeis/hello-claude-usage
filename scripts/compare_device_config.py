@@ -45,7 +45,8 @@ def sources() -> list[pathlib.Path]:
     app = ROOT / "main"
     return sorted((LVGL / "src").rglob("*.c")) + [
         app / "display.c", app / "display_format.c", app / "usage_heading_font.c",
-        app / "usage_values_font.c", app / "usage_ui_font.c", NATIVE / "renderer.c",
+        app / "usage_values_font.c", app / "usage_ui_font.c",
+        app / "usage_status_font.c", app / "usage_meta_font.c", NATIVE / "renderer.c",
     ]
 
 

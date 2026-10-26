@@ -21,6 +21,7 @@ pnpm --store-dir .deps/pnpm-store dlx lv_font_conv@1.5.3 --font .deps/fonts/usag
 pnpm --store-dir .deps/pnpm-store dlx lv_font_conv@1.5.3 --font .deps/fonts/usage-values.ttf --size 48 --bpp 4 --format lvgl --symbols '0123456789%-' --no-compress --lv-font-name usage_values_font -o main/usage_values_font.c
 pnpm --store-dir .deps/pnpm-store dlx lv_font_conv@1.5.3 --font .deps/fonts/usage-values.ttf --size 23 --bpp 4 --format lvgl --range 0x20-0x7e --symbols 'äöüÄÖÜß' --no-compress --lv-font-name usage_ui_font -o main/usage_ui_font.c
 pnpm --store-dir .deps/pnpm-store dlx lv_font_conv@1.5.3 --font .deps/fonts/usage-values.ttf --size 16 --bpp 4 --format lvgl --range 0x20-0x7e --symbols 'äöüÄÖÜß' --no-compress --lv-font-name usage_status_font -o main/usage_status_font.c
+pnpm --store-dir .deps/pnpm-store dlx lv_font_conv@1.5.3 --font .deps/fonts/usage-values.ttf --size 12 --bpp 4 --format lvgl --range 0x20-0x7e --no-compress --lv-font-name usage_meta_font -o main/usage_meta_font.c
 python3 - <<'PY'
 from pathlib import Path
 for name, copyright in [
@@ -33,5 +34,7 @@ for name, copyright in [
 path = Path('main/usage_ui_font.c')
 path.write_text('/* Lato Bold; SIL Open Font License 1.1.\n * Copyright (c) 2010-2014 tyPoland Lukasz Dziedzic.\n * See licenses/usage-values-OFL.txt.\n */\n' + path.read_text())
 path = Path('main/usage_status_font.c')
+path.write_text('/* Lato Bold; SIL Open Font License 1.1.\n * Copyright (c) 2010-2014 tyPoland Lukasz Dziedzic.\n * See licenses/usage-values-OFL.txt.\n */\n' + path.read_text())
+path = Path('main/usage_meta_font.c')
 path.write_text('/* Lato Bold; SIL Open Font License 1.1.\n * Copyright (c) 2010-2014 tyPoland Lukasz Dziedzic.\n * See licenses/usage-values-OFL.txt.\n */\n' + path.read_text())
 PY

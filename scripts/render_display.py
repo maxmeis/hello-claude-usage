@@ -24,11 +24,9 @@ SCENES = ("usage", "usage-full", "unknown", "offline", "setup", "updating", "err
           "face-refresh", "boot", "boot-slow", "boot-interrupt", "mascot-motion",
           "mascot-pause-setup", "mascot-pause-error", "mascot-pause-offline",
           "mascot-pause-updating", "mascot-pause-fullface", "mascot-pause-stale",
-          "mascot-pause-tap")
+          "mascot-pause-tap", "footer-words", "footer-minute", "footer-error")
 FACE_FRAMES = ("open", "both-closed", "wink", "done")
 BOOT_FRAMES = ("boot-open", "boot-status", "boot-done")
-MASCOT_FRAMES = ("rest", *(f"shuffle-{phase:02d}" for phase in range(1, 10)),
-                 "bob", "return", "return-two")
 
 
 def chunk(kind: bytes, data: bytes) -> bytes:
@@ -54,6 +52,7 @@ def build(sanitize: bool) -> None:
     sources += [ROOT / "main" / "display.c", ROOT / "main" / "display_format.c",
                 ROOT / "main" / "usage_heading_font.c", ROOT / "main" / "usage_values_font.c",
                 ROOT / "main" / "usage_ui_font.c", ROOT / "main" / "usage_status_font.c",
+                ROOT / "main" / "usage_meta_font.c",
                 NATIVE / "renderer.c"]
     cmd = ["clang", "-std=gnu11", "-O1", "-DLV_CONF_INCLUDE_SIMPLE", "-DLV_LVGL_H_INCLUDE_SIMPLE",
            "-I", str(NATIVE), "-I", str(ROOT / "main"), "-I", str(LVGL),
@@ -79,12 +78,23 @@ def main() -> None:
     for scene in args.scenes or SCENES:
         if scene == "mascot-motion":
             base = OUTPUT / "mascot-motion"
+            for old in OUTPUT.glob("mascot-motion-*.ppm"):
+                old.unlink()
+            for old in OUTPUT.glob("mascot-motion-*.png"):
+                old.unlink()
             subprocess.run([str(EXE), scene, f"{base}.ppm"], check=True, cwd=ROOT)
-            for phase in MASCOT_FRAMES:
-                ppm = OUTPUT / f"mascot-motion-{phase}.ppm"
-                if not ppm.exists():
-                    continue
-                png = OUTPUT / f"mascot-motion-{phase}.png"
+            for ppm in sorted(OUTPUT.glob("mascot-motion-*.ppm")):
+                png = ppm.with_suffix(".png")
+                ppm_to_png(ppm, png)
+                ppm.unlink()
+                print(png.relative_to(ROOT))
+            continue
+        if scene == "footer-words":
+            base = OUTPUT / "footer-words"
+            subprocess.run([str(EXE), scene, f"{base}.ppm"], check=True, cwd=ROOT)
+            for phase in ("start", "next"):
+                ppm = OUTPUT / f"footer-words-{phase}.ppm"
+                png = OUTPUT / f"footer-words-{phase}.png"
                 ppm_to_png(ppm, png)
                 ppm.unlink()
                 print(png.relative_to(ROOT))

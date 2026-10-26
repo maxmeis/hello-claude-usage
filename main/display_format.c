@@ -112,6 +112,28 @@ void display_format_reset(char *out, size_t capacity, const char *iso, int64_t n
     }
 }
 
+void display_format_age(char *out, size_t capacity, int64_t age_seconds)
+{
+    if (!out || capacity == 0) return;
+    out[0] = '\0';
+
+    if (age_seconds < 60) {
+        (void)snprintf(out, capacity, "%s", "Just now");
+    } else if (age_seconds < 3600) {
+        int64_t minutes = age_seconds / 60;
+        (void)snprintf(out, capacity, "%lld minute%s ago",
+                       (long long)minutes, minutes == 1 ? "" : "s");
+    } else if (age_seconds < 86400) {
+        int64_t hours = age_seconds / 3600;
+        (void)snprintf(out, capacity, "%lld hour%s ago",
+                       (long long)hours, hours == 1 ? "" : "s");
+    } else {
+        int64_t days = age_seconds / 86400;
+        (void)snprintf(out, capacity, "%lld day%s ago",
+                       (long long)days, days == 1 ? "" : "s");
+    }
+}
+
 static uint32_t interpolate_color(uint32_t first, uint32_t second, float fraction)
 {
     uint32_t result = 0;

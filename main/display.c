@@ -19,6 +19,7 @@
 #define CARD 0x252B27
 #define TEXT 0xF9F6EF
 #define MUTED 0xDDDCD6
+#define META 0xA6A49F
 #define ORANGE 0xD97757
 #define TRACK 0x655A64
 #define PILL 0x5C515C
@@ -38,9 +39,10 @@
 #define FACE_EYE_H 128
 #define MASCOT_X 24
 #define MASCOT_Y 24
-#define MASCOT_TICK_MS 150
-#define MASCOT_CYCLE_MS 8000
-#define MASCOT_PLAY_START_MS 6300
+#define MASCOT_TICK_MS 100
+#define MASCOT_CYCLE_MS 4000
+#define MASCOT_PLAY_START_MS 1200
+#define WORD_MS 3000
 
 typedef struct {
     lv_obj_t *value;
@@ -50,9 +52,11 @@ typedef struct {
 } card_t;
 
 static lv_obj_t *s_content;
-static lv_obj_t *s_mascot, *s_mascot_left_foot, *s_mascot_right_foot;
+static lv_obj_t *s_mascot, *s_mascot_left_arm, *s_mascot_right_arm;
+static lv_obj_t *s_mascot_left_foot, *s_mascot_right_foot;
 static lv_obj_t *s_clock;
 static lv_obj_t *s_footer;
+static lv_obj_t *s_updated_age;
 static lv_obj_t *s_refresh_hitbox;
 static lv_obj_t *s_face, *s_face_left_eye, *s_face_right_eye, *s_boot_label;
 static lv_timer_t *s_face_timer;
@@ -67,8 +71,16 @@ static int8_t s_mascot_frame = -1;
 static display_refresh_callback_t s_refresh_callback;
 static void *s_refresh_context;
 static int64_t s_measured_us;
+static int64_t s_word_started_us;
+static bool s_unknown_usage;
 static char s_error[72];
 static const char *s_status_prefix = "Error";
+/* Decorative idle copy; it does not represent a request or live progress. */
+static const char *const s_idle_words[] = {
+    "* Pondering...", "* Mulling...", "* Cogitating...",
+    "* Elucidating...", "* Divining...", "* Ruminating...",
+};
+static void refresh(lv_timer_t *timer);
 
 static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, uint32_t color,
                        int x, int y, int width, const char *value)
@@ -118,15 +130,15 @@ static void mascot(lv_obj_t *screen)
     s_mascot = lv_obj_create(screen);
     lv_obj_remove_style_all(s_mascot);
     lv_obj_set_pos(s_mascot, MASCOT_X, MASCOT_Y);
-    lv_obj_set_size(s_mascot, 56, 40);
+    lv_obj_set_size(s_mascot, 68, 56);
     lv_obj_set_style_bg_opa(s_mascot, LV_OPA_TRANSP, 0);
     lv_obj_set_style_pad_all(s_mascot, 0, 0);
     lv_obj_clear_flag(s_mascot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     pixel(s_mascot, 8, 8, 36, 24, ORANGE);
     pixel(s_mascot, 14, 4, 7, 4, ORANGE);
     pixel(s_mascot, 31, 4, 7, 4, ORANGE);
-    pixel(s_mascot, 4, 14, 4, 16, ORANGE);
-    pixel(s_mascot, 44, 14, 4, 16, ORANGE);
+    s_mascot_left_arm = pixel(s_mascot, 4, 14, 4, 16, ORANGE);
+    s_mascot_right_arm = pixel(s_mascot, 44, 14, 4, 16, ORANGE);
     s_mascot_left_foot = pixel(s_mascot, 14, 32, 6, 5, ORANGE);
     pixel(s_mascot, 23, 32, 6, 5, ORANGE);
     s_mascot_right_foot = pixel(s_mascot, 32, 32, 6, 5, ORANGE);
@@ -137,12 +149,23 @@ static void mascot(lv_obj_t *screen)
 typedef struct {
     int8_t x, y;
     int8_t lifted_foot; /* -1 left, +1 right, 0 neither */
+    int8_t left_arm_y, right_arm_y;
 } mascot_frame_t;
 
-/* Six and a half seconds still, then a 1.5 s stepped shuffle. */
+/* Rest 1.2 s, walk and bob 2.4 s, rest 0.4 s. All coordinates are pixels. */
 static const mascot_frame_t s_mascot_frames[] = {
-    {1, 0, -1}, {2, 0, 1}, {3, 1, -1}, {4, 1, 1}, {4, 2, -1},
-    {3, 1, 1}, {2, 1, -1}, {1, 0, 1}, {0, 0, -1}, {0, 0, 0},
+    {0, -1, -1, -1,  1}, {1, -2,  1,  1, -1},
+    {2, -3, -1, -2,  1}, {3, -4,  1,  1, -2},
+    {4, -3, -1, -2,  1}, {6, -2,  1,  1, -2},
+    {8, -1, -1, -1,  1}, {10, 0,  1,  1, -1},
+    {12, 1, -1, -2,  1}, {12, 2,  1,  1, -2},
+    {12, 3, -1, -2,  1}, {12, 4,  1,  1, -2},
+    {11, 3, -1, -1,  1}, {10, 2,  1,  1, -1},
+    {9, 1, -1, -2,  1}, {8, 0,  1,  1, -2},
+    {7, -1, -1, -1,  1}, {6, -2,  1,  1, -1},
+    {5, -3, -1, -2,  1}, {4, -2,  1,  1, -2},
+    {3, -1, -1, -1,  1}, {2, 0,  1,  1, -1},
+    {1, 0, -1, -1,  1}, {0, 0,  0,  0,  0},
 };
 
 static void mascot_reset(void)
@@ -152,6 +175,8 @@ static void mascot_reset(void)
     lv_obj_set_pos(s_mascot, MASCOT_X, MASCOT_Y);
     lv_obj_set_y(s_mascot_left_foot, 32);
     lv_obj_set_y(s_mascot_right_foot, 32);
+    lv_obj_set_y(s_mascot_left_arm, 14);
+    lv_obj_set_y(s_mascot_right_arm, 14);
     s_mascot_frame = -1;
 }
 
@@ -182,8 +207,10 @@ static void mascot_tick(lv_timer_t *timer)
     }
     const mascot_frame_t *pose = &s_mascot_frames[frame];
     lv_obj_set_pos(s_mascot, MASCOT_X + pose->x, MASCOT_Y + pose->y);
-    lv_obj_set_y(s_mascot_left_foot, pose->lifted_foot < 0 ? 31 : 32);
-    lv_obj_set_y(s_mascot_right_foot, pose->lifted_foot > 0 ? 31 : 32);
+    lv_obj_set_y(s_mascot_left_foot, pose->lifted_foot < 0 ? 29 : 32);
+    lv_obj_set_y(s_mascot_right_foot, pose->lifted_foot > 0 ? 29 : 32);
+    lv_obj_set_y(s_mascot_left_arm, 14 + pose->left_arm_y);
+    lv_obj_set_y(s_mascot_right_arm, 14 + pose->right_arm_y);
     s_mascot_frame = frame;
 }
 
@@ -268,6 +295,7 @@ static void face_tick(lv_timer_t *timer)
 static void start_face(void)
 {
     mascot_reset();
+    s_word_started_us = 0;
     s_face_active = true;
     s_face_started_us = esp_timer_get_time();
     lv_obj_set_style_bg_opa(s_face, LV_OPA_TRANSP, 0);
@@ -319,9 +347,10 @@ static void clear_content(void)
 
 static void footer(const char *message)
 {
-    /* Long failures keep their retry detail; ordinary updates stay on one line. */
-    lv_obj_set_y(s_footer, strlen(message) > 48 ? 409 : 429);
-    lv_label_set_text(s_footer, message);
+    /* Two lines of error detail fit above the separate timestamp. */
+    lv_obj_set_y(s_footer, strlen(message) > 48 ? 405 : 418);
+    if (strcmp(lv_label_get_text(s_footer), message) != 0)
+        lv_label_set_text(s_footer, message);
     lv_obj_clear_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
 }
 
@@ -333,6 +362,7 @@ static void footer_clicked(lv_event_t *event)
     s_refresh_pending = true;
     if (!s_refresh_callback(s_refresh_context)) s_refresh_pending = false;
     else mascot_reset();
+    refresh(NULL);
 }
 
 /* LVGL timer callbacks run on the LVGL task, under the port's own lock. */
@@ -359,18 +389,31 @@ static void refresh(lv_timer_t *timer)
     bool stale = age > STALE_SEC;
     lv_obj_set_style_bg_opa(s_five.fill, stale ? LV_OPA_50 : LV_OPA_COVER, 0);
     lv_obj_set_style_bg_opa(s_week.fill, stale ? LV_OPA_50 : LV_OPA_COVER, 0);
+    char age_text[32];
+    display_format_age(age_text, sizeof(age_text), age);
+    if (strcmp(lv_label_get_text(s_updated_age), age_text) != 0)
+        lv_label_set_text(s_updated_age, age_text);
+    lv_obj_clear_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
+
     char message[96];
     if (s_error[0]) {
         snprintf(message, sizeof(message), "%s: %s", s_status_prefix, s_error);
-    } else if (s_updating) {
-        snprintf(message, sizeof(message), "Updating: last update %lldm ago", (long long)(age / 60));
+    } else if (s_updating || s_refresh_pending || s_cycle_inflight) {
+        snprintf(message, sizeof(message), "Updating...");
     } else if (stale) {
-        snprintf(message, sizeof(message), "Stale: updated %lldm ago", (long long)(age / 60));
-    } else if (age < 60) {
-        snprintf(message, sizeof(message), "Updated %llds ago", (long long)age);
+        snprintf(message, sizeof(message), "Stale");
+    } else if (s_unknown_usage) {
+        snprintf(message, sizeof(message), "Unknown");
     } else {
-        snprintf(message, sizeof(message), "Updated %lldm ago", (long long)(age / 60));
+        if (!s_word_started_us) s_word_started_us = esp_timer_get_time();
+        size_t word_count = sizeof(s_idle_words) / sizeof(s_idle_words[0]);
+        size_t word = (size_t)(((esp_timer_get_time() - s_word_started_us) / 1000) /
+                               WORD_MS) % word_count;
+        snprintf(message, sizeof(message), "%s", s_idle_words[word]);
     }
+    if (s_error[0] || s_updating || s_refresh_pending || s_cycle_inflight ||
+        stale || s_unknown_usage || s_boot_active || s_face_active || s_setup_visible)
+        s_word_started_us = 0;
     footer(message);
 
     char reset[64];
@@ -383,8 +426,10 @@ static void refresh(lv_timer_t *timer)
 
 static void status(const char *title, const char *detail)
 {
+    s_word_started_us = 0;
     clear_content();
     lv_obj_add_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
     label(s_content, &usage_ui_font, TEXT, 0, 24, W,
           title && *title ? title : "Starting");
     lv_obj_t *description = label(s_content, &usage_ui_font, MUTED, 0, 76, W,
@@ -453,11 +498,15 @@ void display_init(void)
     lv_obj_set_style_outline_width(s_content, 0, 0);
     lv_obj_set_style_pad_all(s_content, 0, 0);
     lv_obj_clear_flag(s_content, LV_OBJ_FLAG_SCROLLABLE);
-    s_footer = label(screen, &usage_status_font, ORANGE, 24, 429, W, "");
+    s_footer = label(screen, &usage_status_font, ORANGE, 24, 418, W, "");
     lv_obj_set_style_text_align(s_footer, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_footer, LV_LABEL_LONG_WRAP);
-    lv_obj_set_height(s_footer, 51);
+    lv_obj_set_height(s_footer, 34);
     lv_obj_add_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
+    s_updated_age = label(screen, &usage_meta_font, META, 240, 442, 216, "");
+    lv_obj_set_style_text_align(s_updated_age, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_set_height(s_updated_age, 14);
+    lv_obj_add_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
     s_refresh_hitbox = lv_obj_create(screen);
     lv_obj_remove_style_all(s_refresh_hitbox);
     lv_obj_set_pos(s_refresh_hitbox, 24, 405);
@@ -528,6 +577,7 @@ void display_setup(const char *url)
 {
     lv_port_sem_take();
     mascot_reset();
+    s_word_started_us = 0;
     s_boot_active = false;
     s_has_usage = false;
     s_updating = false;
@@ -542,6 +592,7 @@ void display_setup(const char *url)
     }
     clear_content();
     lv_obj_add_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
     label(s_content, &usage_ui_font, TEXT, 0, 0, W, "Connect Claude");
     /* White 252 px field, 192 px code, 30 px quiet zone on each side. */
     lv_obj_t *field = rect(s_content, 90, 50, 252, 252, 0xFFFFFF, 0);
@@ -570,6 +621,8 @@ void display_usage(float five_used, const char *five_reset,
     update_card(&s_five, five_used, five_reset);
     update_card(&s_week, week_used, week_reset);
     s_measured_us = esp_timer_get_time();
+    s_unknown_usage = !isfinite(five_used) || five_used < 0.0f || five_used > 100.0f ||
+                      !isfinite(week_used) || week_used < 0.0f || week_used > 100.0f;
     s_has_usage = true;
     s_setup_visible = false;
     s_updating = false;

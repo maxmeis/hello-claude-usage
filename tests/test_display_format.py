@@ -26,6 +26,9 @@ class DisplayFormatTests(unittest.TestCase):
                                                  ctypes.c_char_p, ctypes.c_int64,
                                                  ctypes.c_bool]
         cls.lib.display_format_reset.restype = None
+        cls.lib.display_format_age.argtypes = [ctypes.c_char_p, ctypes.c_size_t,
+                                               ctypes.c_int64]
+        cls.lib.display_format_age.restype = None
         cls.lib.display_quota_color.argtypes = [ctypes.c_float]
         cls.lib.display_quota_color.restype = ctypes.c_uint32
 
@@ -67,6 +70,34 @@ class DisplayFormatTests(unittest.TestCase):
         output = ctypes.create_string_buffer(capacity)
         self.lib.display_format_reset(output, capacity, iso, now, clock_ready)
         return output.value.decode()
+
+    def format_age(self, age_seconds, capacity=80):
+        output = ctypes.create_string_buffer(capacity)
+        self.lib.display_format_age(output, capacity, age_seconds)
+        return output.value.decode()
+
+    def test_age_format_uses_floor_whole_units_and_singular_plural(self):
+        cases = [
+            (-1, "Just now"), (0, "Just now"), (59, "Just now"),
+            (60, "1 minute ago"), (119, "1 minute ago"),
+            (120, "2 minutes ago"), (3599, "59 minutes ago"),
+            (3600, "1 hour ago"), (7199, "1 hour ago"),
+            (7200, "2 hours ago"), (86399, "23 hours ago"),
+            (86400, "1 day ago"), (172800, "2 days ago"),
+        ]
+        for age_seconds, expected in cases:
+            with self.subTest(age_seconds=age_seconds):
+                self.assertEqual(self.format_age(age_seconds), expected)
+
+    def test_age_format_handles_int64_extremes_and_bounded_output(self):
+        self.assertEqual(self.format_age(-(1 << 63)), "Just now")
+        self.assertEqual(self.format_age((1 << 63) - 1),
+                         f"{((1 << 63) - 1) // 86400} days ago")
+        self.assertEqual(self.format_age(120, capacity=5), "2 mi")
+        untouched = ctypes.create_string_buffer(b"x", 1)
+        self.lib.display_format_age(untouched, 0, 60)
+        self.assertEqual(untouched.raw, b"x")
+        self.lib.display_format_age(None, 10, 60)
 
     def test_reset_countdown_uses_utc_and_expected_units(self):
         reset = calendar.timegm(datetime(2026, 10, 27, 4, 0).timetuple())

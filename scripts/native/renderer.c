@@ -29,6 +29,7 @@ static int write_ppm(const char *path);
 static int contains_label(lv_obj_t *object, const char *prefix);
 static lv_obj_t *find_label(lv_obj_t *object, const char *text);
 static void assert_usage_footer(void);
+static void assert_age_label(const char *text);
 static lv_obj_t *find_clock(lv_obj_t *object);
 static void assert_clock_unchanged(void);
 static lv_obj_t *clock_label;
@@ -284,7 +285,7 @@ static void face_refresh(const char *base, const char *five_reset, const char *w
     step_until(320);
     lv_refr_now(NULL);
     assert_face_open();
-    assert(contains_label(lv_scr_act(), "Updating:"));
+    assert(contains_label(lv_scr_act(), "Updating..."));
     pointer_tap(240, 430);
     assert(refresh_requests == 2 && "footer tap is ignored while face is active");
     char path[512];
@@ -319,7 +320,7 @@ static void face_refresh(const char *base, const char *five_reset, const char *w
     step_until(5000);
     lv_refr_now(NULL);
     assert(!pixel_is_orange(10, 10) && "face overlay is hidden after five seconds");
-    assert(contains_label(lv_scr_act(), "Updating:"));
+    assert(contains_label(lv_scr_act(), "Updating..."));
     make_frame_path(path, sizeof(path), base, "done");
     save_ppm(path);
 
@@ -347,7 +348,7 @@ static void face_refresh(const char *base, const char *five_reset, const char *w
     display_updating();
     step_until(5000);
     assert(!pixel_is_orange(10, 10));
-    assert(contains_label(lv_scr_act(), "Updating:"));
+    assert(contains_label(lv_scr_act(), "Updating..."));
     step_until(7000);
     assert(!pixel_is_orange(10, 10));
     display_refresh_cycle_end();
@@ -470,7 +471,7 @@ static void assert_mascot_only_changed(const lv_color_t *reference)
 {
     for (int y = 0; y < HEIGHT; ++y) {
         for (int x = 0; x < WIDTH; ++x) {
-            if ((x >= 24 && x < 86 && y >= 24 && y < 70) || y >= 405) continue;
+            if ((x >= 24 && x <= 104 && y >= 24 && y <= 80) || y >= 405) continue;
             assert(frame[y * WIDTH + x].full == reference[y * WIDTH + x].full &&
                    "mascot movement must not move or repaint other dashboard content");
         }
@@ -479,8 +480,8 @@ static void assert_mascot_only_changed(const lv_color_t *reference)
 
 static void assert_mascot_region_equal(const lv_color_t *reference)
 {
-    for (int y = 24; y < 70; ++y)
-        for (int x = 24; x < 86; ++x)
+    for (int y = 24; y <= 80; ++y)
+        for (int x = 24; x <= 104; ++x)
             assert(frame[y * WIDTH + x].full == reference[y * WIDTH + x].full &&
                    "mascot pixels must remain still");
 }
@@ -491,8 +492,8 @@ static void mascot_orange_bounds(int *min_x, int *min_y, int *max_x, int *max_y)
     *min_y = HEIGHT;
     *max_x = -1;
     *max_y = -1;
-    for (int y = 20; y < 76; ++y) {
-        for (int x = 20; x < 92; ++x) {
+    for (int y = 20; y <= 84; ++y) {
+        for (int x = 20; x <= 108; ++x) {
             if (!pixel_is_orange(x, y)) continue;
             if (x < *min_x) *min_x = x;
             if (x > *max_x) *max_x = x;
@@ -507,20 +508,21 @@ static void assert_mascot_offset_is_bounded(void)
 {
     int min_x, min_y, max_x, max_y;
     mascot_orange_bounds(&min_x, &min_y, &max_x, &max_y);
-    (void)max_x;
-    (void)max_y;
-    assert(min_x >= 28 && min_x <= 32 && "mascot horizontal shuffle must stay within four pixels");
-    assert(min_y >= 28 && min_y <= 30 && "mascot bob must stay within two pixels");
+    assert(min_x >= 24 && max_x <= 104 && min_y >= 24 && max_y <= 80 &&
+           "all mascot pixels must remain in the clear header area");
 }
 
 static void mascot_motion_scene(const char *base)
 {
-    display_usage(50.0f, "2026-10-26T23:00:00Z", 89.0f, "2026-11-02T20:00:00Z");
+    char five_reset[32], week_reset[32];
+    reset_iso(five_reset, sizeof(five_reset), 3 * 3600);
+    reset_iso(week_reset, sizeof(week_reset), 7 * 86400);
+    display_usage(50.0f, five_reset, 89.0f, week_reset);
     scenario_elapsed_ms = 0;
     lv_refr_now(NULL);
     lv_color_t initial[WIDTH * HEIGHT];
     memcpy(initial, frame, sizeof(initial));
-    step_until(6000);
+    step_until(1000);
     lv_refr_now(NULL);
     assert_black_corners();
     assert_mascot_region_equal(initial);
@@ -541,13 +543,16 @@ static void mascot_motion_scene(const char *base)
     lv_color_t previous[WIDTH * HEIGHT];
     memcpy(previous, rest, sizeof(previous));
     int captured = 0, moving_samples = 0;
-    bool bob_seen = false;
-    for (uint32_t t = 6020; t <= 8200; t += 20) {
+    int furthest_x = rest_min_x, highest_y = rest_min_y, lowest_y = rest_min_y;
+    bool left_step_seen = false, right_step_seen = false, arm_wave_seen = false;
+    bool left_saved = false, right_saved = false, high_saved = false;
+    bool low_saved = false, step_saved = false, bob_saved = false;
+    for (uint32_t t = 1020; t <= 3800; t += 20) {
         step_until(t);
         lv_refr_now(NULL);
         int changed = 0;
-        for (int y = 24; y < 70; ++y)
-            for (int x = 24; x < 86; ++x)
+        for (int y = 24; y <= 80; ++y)
+            for (int x = 24; x <= 104; ++x)
                 changed += frame[y * WIDTH + x].full != rest[y * WIDTH + x].full;
         if (changed == 0) continue;
         ++moving_samples;
@@ -555,32 +560,61 @@ static void mascot_motion_scene(const char *base)
         assert_mascot_offset_is_bounded();
         int min_x, min_y, max_x, max_y;
         mascot_orange_bounds(&min_x, &min_y, &max_x, &max_y);
-        assert(min_x >= 28 && min_x <= 32 && min_y >= 28 && min_y <= 30 &&
-               max_x <= 75 && max_y <= 62 &&
-               "shuffle positions must stay within four horizontal and two vertical pixels");
-        if (min_y > 28 && !bob_seen) {
-            bob_seen = true;
+        if (min_x > furthest_x) furthest_x = min_x;
+        if (min_y < highest_y) highest_y = min_y;
+        if (min_y > lowest_y) lowest_y = min_y;
+        int group_x = min_x - 4, group_y = min_y - 4;
+        if (pixel_is_orange(group_x + 14, group_y + 29)) left_step_seen = true;
+        if (pixel_is_orange(group_x + 32, group_y + 29)) right_step_seen = true;
+        if (pixel_is_orange(group_x + 4, group_y + 12)) arm_wave_seen = true;
+        if (min_x == rest_min_x && !left_saved) {
+            save_named_frame(base, "left");
+            left_saved = true;
+        }
+        if (min_x >= rest_min_x + 12 && !right_saved) {
+            save_named_frame(base, "right");
+            right_saved = true;
+        }
+        if (min_y <= rest_min_y - 4 && !high_saved) {
+            save_named_frame(base, "high");
+            high_saved = true;
+        }
+        if (min_y >= rest_min_y + 4 && !low_saved) {
+            save_named_frame(base, "low");
+            low_saved = true;
+        }
+        if ((left_step_seen || right_step_seen) && !step_saved) {
+            save_named_frame(base, "step");
+            step_saved = true;
+        }
+        if (min_y > rest_min_y && !bob_saved) {
             save_named_frame(base, "bob");
+            bob_saved = true;
         }
         int pose_changed = 0;
-        for (int y = 24; y < 70; ++y)
-            for (int x = 24; x < 86; ++x)
+        for (int y = 24; y <= 80; ++y)
+            for (int x = 24; x <= 104; ++x)
                 pose_changed |= frame[y * WIDTH + x].full != previous[y * WIDTH + x].full;
-        if (pose_changed && captured < 10) {
+        if (pose_changed) {
             char name[32];
-            snprintf(name, sizeof(name), "shuffle-%02d", ++captured);
+            snprintf(name, sizeof(name), "pose-%02d", ++captured);
             save_named_frame(base, name);
             memcpy(previous, frame, sizeof(previous));
         }
     }
-    assert(moving_samples > 0 && captured > 0 && "idle mascot must visibly shuffle");
-    assert(bob_seen && "shuffle must include a visible vertical bob");
-    step_until(8400);
+    assert(moving_samples > 0 && captured > 0 && "idle mascot must visibly move");
+    assert(furthest_x - rest_min_x >= 8 && lowest_y - highest_y >= 4 &&
+           "mascot must travel visibly farther than the old shuffle");
+    assert(left_step_seen && right_step_seen && arm_wave_seen &&
+           "mascot must animate both feet and an arm independently");
+    assert(left_saved && right_saved && high_saved && low_saved && step_saved && bob_saved &&
+           "reference captures must include the full walking range");
+    step_until(4000);
     lv_refr_now(NULL);
     assert_mascot_region_equal(rest);
     save_named_frame(base, "return");
 
-    step_until(16000);
+    step_until(8000);
     lv_refr_now(NULL);
     assert_mascot_region_equal(rest);
     save_named_frame(base, "return-two");
@@ -588,17 +622,20 @@ static void mascot_motion_scene(const char *base)
 
 static void mascot_pause_scene(const char *scene, const char *base)
 {
-    display_usage(50.0f, "2026-10-26T23:00:00Z", 89.0f, "2026-11-02T20:00:00Z");
+    char five_reset[32], week_reset[32];
+    reset_iso(five_reset, sizeof(five_reset), 3 * 3600);
+    reset_iso(week_reset, sizeof(week_reset), 7 * 86400);
+    display_usage(50.0f, five_reset, 89.0f, week_reset);
     scenario_elapsed_ms = 0;
     lv_refr_now(NULL);
     lv_color_t initial[WIDTH * HEIGHT];
     memcpy(initial, frame, sizeof(initial));
     bool moving = false;
-    for (uint32_t t = 6020; t <= 6800 && !moving; t += 20) {
+    for (uint32_t t = 1020; t <= 2200 && !moving; t += 20) {
         step_until(t);
         lv_refr_now(NULL);
-        for (int y = 24; y < 70 && !moving; ++y)
-            for (int x = 24; x < 86; ++x)
+        for (int y = 24; y <= 80 && !moving; ++y)
+            for (int x = 24; x <= 104; ++x)
                 if (frame[y * WIDTH + x].full != initial[y * WIDTH + x].full) {
                     moving = true;
                     break;
@@ -635,8 +672,8 @@ static void mascot_pause_scene(const char *scene, const char *base)
     lv_color_t before[WIDTH * HEIGHT];
     memcpy(before, frame, sizeof(before));
     if (strcmp(scene, "fullface") != 0) {
-        for (int y = 24; y < 70; ++y)
-            for (int x = 24; x < 86; ++x)
+        for (int y = 24; y <= 80; ++y)
+            for (int x = 24; x <= 104; ++x)
                 assert(frame[y * WIDTH + x].full == rest[y * WIDTH + x].full &&
                        "inhibition must reset the mascot synchronously");
     }
@@ -648,8 +685,8 @@ static void mascot_pause_scene(const char *scene, const char *base)
         /* The full-face overlay is intentionally animated; the mascot remains hidden. */
         assert(pixel_is_orange(10, 10) && "full-face scene must remain visibly active");
     } else {
-        for (int y = 24; y < 70; ++y)
-            for (int x = 24; x < 86; ++x)
+        for (int y = 24; y <= 80; ++y)
+            for (int x = 24; x <= 104; ++x)
                 assert(frame[y * WIDTH + x].full == before[y * WIDTH + x].full &&
                        "mascot must remain paused for non-healthy display states");
     }
@@ -663,8 +700,68 @@ static void assert_usage_footer(void)
     assert(lv_obj_get_style_text_font(footer, LV_PART_MAIN) == &usage_status_font &&
            "refresh footer must use the compact production status font");
     assert(lv_obj_get_x(footer) == 24 && lv_obj_get_width(footer) == 432);
-    assert(lv_obj_get_y(footer) == 409 && lv_obj_get_height(footer) == 51 &&
-           "long error must wrap inside the unchanged footer bounds");
+    assert(lv_obj_get_y(footer) == 405 && lv_obj_get_height(footer) == 34 &&
+           "long error must wrap above the timestamp");
+    assert_age_label("Just now");
+}
+
+static void assert_age_label(const char *text)
+{
+    lv_obj_t *age = find_label(lv_scr_act(), text);
+    assert(age && "last successful response age must stay visible");
+    assert(!lv_obj_has_flag(age, LV_OBJ_FLAG_HIDDEN));
+    assert(lv_obj_get_style_text_font(age, LV_PART_MAIN) == &usage_meta_font &&
+           "timestamp uses the 12 px Lato Bold font");
+    assert(lv_obj_get_x(age) == 240 && lv_obj_get_y(age) == 442 &&
+           lv_obj_get_width(age) == 216 && lv_obj_get_height(age) == 14 &&
+           "timestamp must end 24 px from the right and bottom edges");
+    assert(lv_obj_get_style_text_align(age, LV_PART_MAIN) == LV_TEXT_ALIGN_RIGHT);
+}
+
+static void footer_words_scene(const char *base)
+{
+    char five_reset[32], week_reset[32];
+    reset_iso(five_reset, sizeof(five_reset), 3 * 3600);
+    reset_iso(week_reset, sizeof(week_reset), 7 * 86400);
+    display_usage(50.0f, five_reset, 89.0f, week_reset);
+    lv_refr_now(NULL);
+    lv_obj_t *footer = find_label_prefix(lv_scr_act(), "* ");
+    assert(footer && "healthy usage needs decorative center copy");
+    assert(lv_obj_get_x(footer) == 24 && lv_obj_get_y(footer) == 418 &&
+           lv_obj_get_width(footer) == 432 && lv_obj_get_height(footer) == 34);
+    assert(lv_obj_get_style_text_font(footer, LV_PART_MAIN) == &usage_status_font);
+    assert_age_label("Just now");
+    char first[64];
+    snprintf(first, sizeof(first), "%s", lv_label_get_text(footer));
+    lv_obj_t *clock = find_clock(lv_scr_act());
+    assert(clock);
+    char before_clock[8];
+    snprintf(before_clock, sizeof(before_clock), "%s", lv_label_get_text(clock));
+    save_named_frame(base, "start");
+    step_ms(3100);
+    assert(strncmp(lv_label_get_text(footer), "* ", 2) == 0 &&
+           strcmp(lv_label_get_text(footer), first) != 0 &&
+           "healthy idle words rotate after about three seconds");
+    assert(strcmp(lv_label_get_text(clock), before_clock) == 0 &&
+           "word rotation must not change the clock");
+    assert_usage_card_pixels(1);
+    assert_age_label("Just now");
+    save_named_frame(base, "next");
+}
+
+static void footer_minute_scene(const char *base)
+{
+    char five_reset[32], week_reset[32];
+    reset_iso(five_reset, sizeof(five_reset), 3 * 3600);
+    reset_iso(week_reset, sizeof(week_reset), 7 * 86400);
+    display_usage(50.0f, five_reset, 89.0f, week_reset);
+    assert_age_label("Just now");
+    step_ms(60000);
+    assert_age_label("1 minute ago");
+    step_ms(60000);
+    assert_age_label("2 minutes ago");
+    assert(find_label_prefix(lv_scr_act(), "* "));
+    save_ppm(base);
 }
 
 static void boot_capture(const char *base)
@@ -838,6 +935,14 @@ int main(int argc, char **argv)
         mascot_motion_scene(argv[2]);
         return 0;
     }
+    if (strcmp(argv[1], "footer-words") == 0) {
+        footer_words_scene(argv[2]);
+        return 0;
+    }
+    if (strcmp(argv[1], "footer-minute") == 0) {
+        footer_minute_scene(argv[2]);
+        return 0;
+    }
     if (strncmp(argv[1], "mascot-pause-", 13) == 0) {
         mascot_pause_scene(argv[1] + 13, argv[2]);
         return write_ppm(argv[2]);
@@ -848,17 +953,25 @@ int main(int argc, char **argv)
         display_usage(0.0f, five_reset, 0.0f, week_reset);
     } else if (strcmp(argv[1], "unknown") == 0) {
         display_usage(NAN, NULL, NAN, NULL);
+        assert(contains_label(lv_scr_act(), "Unknown"));
+        assert(!contains_label(lv_scr_act(), "* "));
+        assert_age_label("Just now");
     } else if (strcmp(argv[1], "offline") == 0) {
         display_usage(50.0f, five_reset, 89.0f, week_reset);
         fake_us += 901LL * 1000000LL;
         lv_tick_inc(1000);
         lv_timer_handler();
+        assert(contains_label(lv_scr_act(), "Stale"));
+        assert(!contains_label(lv_scr_act(), "* "));
+        assert_age_label("15 minutes ago");
     } else if (strcmp(argv[1], "setup") == 0) {
         display_setup("http://192.168.4.1/setup");
     } else if (strcmp(argv[1], "updating") == 0) {
         display_usage(50.0f, five_reset, 89.0f, week_reset);
         display_updating();
-        assert(contains_label(lv_scr_act(), "Updating:"));
+        assert(contains_label(lv_scr_act(), "Updating..."));
+        assert(!contains_label(lv_scr_act(), "* "));
+        assert_age_label("Just now");
         assert(contains_label(lv_scr_act(), "50%"));
     } else if (strcmp(argv[1], "face-refresh") == 0) {
         face_refresh(argv[2], five_reset, week_reset);
@@ -869,7 +982,7 @@ int main(int argc, char **argv)
         display_status("Usage", "Connection failed; check Wi-Fi settings and try again later");
         assert(contains_label(lv_scr_act(), "Error:"));
         assert_usage_footer();
-        assert(!contains_label(lv_scr_act(), "Updating:"));
+        assert(!contains_label(lv_scr_act(), "Updating..."));
         assert(contains_label(lv_scr_act(), "50%"));
         display_status("Time", "Waiting for clock");
         assert(contains_label(lv_scr_act(), "Waiting:"));
@@ -881,10 +994,19 @@ int main(int argc, char **argv)
         assert(contains_label(lv_scr_act(), "50%"));
         display_status("Usage", "Usage check failed; retrying");
         assert(contains_label(lv_scr_act(), "Error:"));
+    } else if (strcmp(argv[1], "footer-error") == 0) {
+        display_usage(50.0f, five_reset, 89.0f, week_reset);
+        step_ms(120000);
+        display_status("Usage", "Connection failed; check Wi-Fi settings and try again later");
+        assert(contains_label(lv_scr_act(), "Error:"));
+        assert(!contains_label(lv_scr_act(), "* "));
+        assert_age_label("2 minutes ago");
     } else if (strcmp(argv[1], "disconnected") == 0) {
         display_usage(50.0f, five_reset, 89.0f, week_reset);
         display_status("Wi-Fi", "Connection failed; retrying");
         assert(contains_label(lv_scr_act(), "Offline:"));
+        assert(!contains_label(lv_scr_act(), "* "));
+        assert_age_label("Just now");
         assert(contains_label(lv_scr_act(), "50%"));
     } else {
         fprintf(stderr, "unknown scene: %s\n", argv[1]);
