@@ -79,6 +79,39 @@ bool display_parse_reset(const char *iso, int64_t *epoch)
     return true;
 }
 
+display_forecast_t display_forecast(float utilized, const char *reset_iso,
+                                    int64_t window_seconds, int64_t sampled_at,
+                                    int64_t now, bool fresh)
+{
+    /* Only the service's five-hour and seven-day quotas have known windows. */
+    if (!fresh || !isfinite(utilized) || utilized < 0.0f || utilized > 100.0f ||
+        (window_seconds != 18000 && window_seconds != 604800) ||
+        sampled_at <= 0 || now < sampled_at) return DISPLAY_FORECAST_UNKNOWN;
+
+    /* Cast before subtraction so even extreme caller timestamps cannot overflow. */
+    if ((uint64_t)now - (uint64_t)sampled_at > 900)
+        return DISPLAY_FORECAST_UNKNOWN;
+
+    int64_t reset_epoch;
+    if (!display_parse_reset(reset_iso, &reset_epoch) || reset_epoch <= now)
+        return DISPLAY_FORECAST_UNKNOWN;
+
+    uint64_t remaining_at_sample = (uint64_t)reset_epoch - (uint64_t)sampled_at;
+    if (remaining_at_sample > (uint64_t)window_seconds)
+        return DISPLAY_FORECAST_UNKNOWN;
+    uint64_t elapsed_at_sample = (uint64_t)window_seconds - remaining_at_sample;
+    if (elapsed_at_sample < 300) return DISPLAY_FORECAST_UNKNOWN;
+
+    if (utilized == 0.0f) return DISPLAY_FORECAST_UNKNOWN;
+    if (utilized == 100.0f) return DISPLAY_FORECAST_TIGHT;
+
+    /* 80% projected use is a conservative warning before full exhaustion. */
+    const double tight_threshold = 80.0;
+    double projected = (double)utilized * (double)window_seconds /
+                       (double)elapsed_at_sample;
+    return projected >= tight_threshold ? DISPLAY_FORECAST_TIGHT : DISPLAY_FORECAST_HEADROOM;
+}
+
 void display_format_reset(char *out, size_t capacity, const char *iso, int64_t now,
                           bool clock_ready)
 {

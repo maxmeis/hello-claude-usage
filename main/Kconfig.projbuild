@@ -1,10 +1,12 @@
 menu "OAuth probe"
     config OAUTH_PROBE_HTTP_PORT
-        int "Local account setup HTTP port"
+        int "Local settings and Wi-Fi setup HTTP port"
         range 1024 65535
         default 8080
         help
-            The random, short-lived setup URL is served on this port over the local Wi-Fi network.
+            The random, short-lived account settings and Wi-Fi setup URLs use
+            this port. Their servers run separately during normal operation
+            and temporary Wi-Fi provisioning.
 endmenu
 
 menu "Display diagnostics"

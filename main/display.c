@@ -10,10 +10,12 @@
 
 #include "bsp_board.h"
 #include "esp_err.h"
+#include "esp_log.h"
 #include "esp_timer.h"
 #include "lv_port.h"
 #include "lvgl.h"
 #include "usage_fonts.h"
+#include "word_clock.h"
 
 #define BG 0x000000
 #define CARD 0x252B27
@@ -21,9 +23,9 @@
 #define MUTED 0xDDDCD6
 #define META 0xA6A49F
 #define ORANGE 0xD97757
-#define TRACK 0x655A64
-#define PILL 0x5C515C
 #define WEEK 0xB3C84D
+#define FORECAST_GREEN 0x89B18B
+#define FORECAST_NEUTRAL 0x777570
 #define W 432
 #define CARD_H 132
 #define CARD_GAP 18
@@ -43,11 +45,27 @@
 #define MASCOT_CYCLE_MS 4000
 #define MASCOT_PLAY_START_MS 1200
 #define WORD_MS 3000
+#define USAGE_VIEW_MS 30000
+#define WORD_X 68
+#define WORD_Y 80
+#define WORD_CELL 40
+#define WORD_COL_SPAN 304
+#define WORD_ROW_SPAN 298
+#define WORD_INACTIVE 0x181818
+
+static const char *const TAG = "display_ui";
+
+typedef enum { VIEW_STATUS, VIEW_USAGE, VIEW_CLOCK } display_view_t;
 
 typedef struct {
     lv_obj_t *value;
     lv_obj_t *fill;
     lv_obj_t *reset;
+    lv_obj_t *forecast_headroom;
+    lv_obj_t *forecast_tight;
+    lv_obj_t *forecast_unknown;
+    float utilized;
+    int64_t sampled_at;
     char reset_iso[64];
 } card_t;
 
@@ -55,15 +73,34 @@ static lv_obj_t *s_content;
 static lv_obj_t *s_mascot, *s_mascot_left_arm, *s_mascot_right_arm;
 static lv_obj_t *s_mascot_left_foot, *s_mascot_right_foot;
 static lv_obj_t *s_clock;
+static lv_obj_t *s_mascot_hitbox, *s_clock_hitbox;
+static lv_obj_t *s_heading;
+static lv_obj_t *s_word_layer, *s_word_hitbox, *s_word_wait;
+static lv_obj_t *s_word_letters[WORD_CLOCK_CELLS];
+static lv_obj_t *s_word_dots[4];
 static lv_obj_t *s_footer;
 static lv_obj_t *s_updated_age;
 static lv_obj_t *s_refresh_hitbox;
+static lv_obj_t *s_settings_hitbox, *s_settings_label;
+static lv_obj_t *s_settings_overlay, *s_settings_title;
+static lv_obj_t *s_settings_detail, *s_settings_qr_field, *s_settings_qr;
+static lv_obj_t *s_settings_name;
+static lv_obj_t *s_wifi_overlay, *s_wifi_title, *s_wifi_detail;
+static lv_obj_t *s_wifi_qr_field, *s_wifi_qr;
+static lv_obj_t *s_wifi_name, *s_setup_name;
+static char s_device_name[sizeof("hello-box-0000")];
 static lv_obj_t *s_face, *s_face_left_eye, *s_face_right_eye, *s_boot_label;
 static lv_timer_t *s_face_timer;
 static card_t s_five, s_week;
 static bool s_clock_ready, s_has_usage, s_updating, s_setup_visible;
+static bool s_time_valid;
+static bool s_manual_clock;
 static bool s_face_active, s_refresh_pending, s_cycle_inflight;
 static bool s_boot_active, s_boot_ready;
+static bool s_settings_active, s_settings_accepted, s_wifi_setup_active;
+static uint32_t s_settings_sequence, s_settings_request_id;
+static display_settings_callback_t s_settings_callback;
+static void *s_settings_context;
 static int64_t s_face_started_us;
 static int64_t s_boot_fade_started_us;
 static int64_t s_mascot_cycle_started_us;
@@ -73,6 +110,11 @@ static void *s_refresh_context;
 static int64_t s_measured_us;
 static int64_t s_word_started_us;
 static bool s_unknown_usage;
+static display_view_t s_view = VIEW_STATUS;
+static int64_t s_usage_deadline_us;
+static int s_word_render_minute = -1;
+static int s_word_render_hour = -1;
+static bool s_word_render_ready;
 static char s_error[72];
 static const char *s_status_prefix = "Error";
 /* Decorative idle copy; it does not represent a request or live progress. */
@@ -81,6 +123,55 @@ static const char *const s_idle_words[] = {
     "* Elucidating...", "* Divining...", "* Ruminating...",
 };
 static void refresh(lv_timer_t *timer);
+static void show_view(display_view_t view);
+static void arm_usage_timeout(void);
+static void close_settings(bool notify_backend);
+static lv_obj_t *rect(lv_obj_t *parent, int x, int y, int width, int height,
+                      uint32_t color, int radius);
+
+static lv_obj_t *forecast_circle(lv_obj_t *parent, uint32_t color)
+{
+    lv_obj_t *circle = rect(parent, 3, 3, 10, 10, color, LV_RADIUS_CIRCLE);
+    lv_obj_clear_flag(circle, LV_OBJ_FLAG_CLICKABLE);
+    return circle;
+}
+
+static lv_obj_t *icon_container(lv_obj_t *parent)
+{
+    lv_obj_t *shape = lv_obj_create(parent);
+    lv_obj_remove_style_all(shape);
+    lv_obj_set_pos(shape, 0, 0);
+    lv_obj_set_size(shape, 16, 16);
+    lv_obj_clear_flag(shape, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    return shape;
+}
+
+static void update_forecast_icon(card_t *card, int64_t now, bool fresh,
+                                 int64_t window_seconds)
+{
+    display_forecast_t forecast = display_forecast(card->utilized, card->reset_iso,
+        window_seconds, card->sampled_at, now, fresh);
+    lv_obj_t *icons[] = {card->forecast_unknown, card->forecast_headroom,
+                         card->forecast_tight};
+    display_forecast_t states[] = {DISPLAY_FORECAST_UNKNOWN,
+                                   DISPLAY_FORECAST_HEADROOM,
+                                   DISPLAY_FORECAST_TIGHT};
+    for (size_t i = 0; i < sizeof(icons) / sizeof(icons[0]); ++i) {
+        if (states[i] == forecast) lv_obj_clear_flag(icons[i], LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(icons[i], LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void update_reset_label(lv_obj_t *target, const char *iso, int64_t now, bool ready)
+{
+    char text[64];
+    display_format_reset(text, sizeof(text), iso, now, ready);
+    const char *compact = text;
+    if (strncmp(text, "Resets in ", 10) == 0) compact = text + 10;
+    else if (strcmp(text, "Reset unknown") == 0) compact = "Unknown";
+    else if (strcmp(text, "Awaiting reset") == 0) compact = "Pending";
+    lv_label_set_text(target, compact);
+}
 
 static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, uint32_t color,
                        int x, int y, int width, const char *value)
@@ -93,7 +184,7 @@ static lv_obj_t *label(lv_obj_t *parent, const lv_font_t *font, uint32_t color,
     lv_obj_set_style_text_font(o, font, 0);
     lv_obj_set_style_text_color(o, lv_color_hex(color), 0);
     lv_obj_set_style_pad_all(o, 0, 0);
-    lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
     lv_label_set_text(o, value ? value : "");
     return o;
 }
@@ -122,6 +213,40 @@ static lv_obj_t *pixel(lv_obj_t *parent, int x, int y, int w, int h, uint32_t co
     lv_obj_t *o = rect(parent, x, y, w, h, color, 0);
     lv_obj_clear_flag(o, LV_OBJ_FLAG_CLICKABLE);
     return o;
+}
+
+static void overlay_qr(lv_obj_t *field, lv_obj_t *qr, lv_obj_t *detail,
+                       const char *payload, const char *failure)
+{
+    if (payload && *payload &&
+        lv_qrcode_update(qr, payload, strlen(payload)) == LV_RES_OK) {
+        lv_obj_clear_flag(field, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    lv_obj_add_flag(field, LV_OBJ_FLAG_HIDDEN);
+    lv_label_set_text(detail, failure);
+}
+
+/* Opaque screen child. Neither QR payload is used as visible copy or logged. */
+static lv_obj_t *create_qr_overlay(lv_obj_t *screen, lv_obj_t **title,
+                                   lv_obj_t **detail, lv_obj_t **field,
+                                   lv_obj_t **qr, lv_obj_t **name)
+{
+    lv_obj_t *overlay = rect(screen, 0, 0, 480, 480, BG, 0);
+    *title = label(overlay, &usage_ui_font, TEXT, 24, 35, W, "");
+    lv_obj_set_style_text_align(*title, LV_TEXT_ALIGN_CENTER, 0);
+    *field = rect(overlay, 114, 99, 252, 252, 0xFFFFFF, 0);
+    *qr = lv_qrcode_create(*field, 192, lv_color_hex(BG), lv_color_hex(0xFFFFFF));
+    lv_obj_set_pos(*qr, 30, 30);
+    lv_obj_add_flag(*field, LV_OBJ_FLAG_HIDDEN);
+    *detail = label(overlay, &usage_status_font, MUTED, 24, 372, W, "");
+    lv_obj_set_style_text_align(*detail, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(*detail, LV_LABEL_LONG_WRAP);
+    lv_obj_set_height(*detail, 40);
+    *name = label(overlay, &usage_meta_font, META, 24, 70, W, s_device_name);
+    lv_obj_set_style_text_align(*name, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_add_flag(overlay, LV_OBJ_FLAG_HIDDEN);
+    return overlay;
 }
 
 /* Squat, square-pixel Clawd. */
@@ -186,7 +311,9 @@ static void mascot_tick(lv_timer_t *timer)
     (void)timer;
     int64_t now = esp_timer_get_time();
     int64_t age = (now - s_measured_us) / 1000000;
-    if (!s_has_usage || s_setup_visible || s_updating || s_error[0] ||
+    if (s_view == VIEW_CLOCK || !s_has_usage || s_setup_visible ||
+        s_settings_active || s_wifi_setup_active || s_updating || s_error[0] ||
+        s_unknown_usage ||
         s_boot_active || s_face_active || s_refresh_pending || s_cycle_inflight ||
         age < 0 || age > STALE_SEC) {
         mascot_reset();
@@ -212,6 +339,114 @@ static void mascot_tick(lv_timer_t *timer)
     lv_obj_set_y(s_mascot_left_arm, 14 + pose->left_arm_y);
     lv_obj_set_y(s_mascot_right_arm, 14 + pose->right_arm_y);
     s_mascot_frame = frame;
+}
+
+static bool usage_healthy(void)
+{
+    if (!s_has_usage || !s_time_valid || s_setup_visible || s_updating ||
+        s_error[0] || s_unknown_usage || s_refresh_pending || s_cycle_inflight ||
+        s_boot_active || s_face_active) return false;
+    int64_t age = (esp_timer_get_time() - s_measured_us) / 1000000;
+    return age >= 0 && age <= STALE_SEC;
+}
+
+/* All callers already hold the LVGL port lock. */
+static void show_view(display_view_t view)
+{
+    if (s_view == view) return;
+    s_view = view;
+    bool clock = view == VIEW_CLOCK;
+    if (clock) {
+        mascot_reset();
+        lv_obj_add_flag(s_mascot, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_heading, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_clock, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_mascot_hitbox, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_clock_hitbox, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_content, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_refresh_hitbox, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_settings_hitbox, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_settings_label, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_word_layer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_word_hitbox, LV_OBJ_FLAG_HIDDEN);
+        /* Child style changes made while hidden are not guaranteed to queue
+         * redraws. Repaint this layer once when it becomes visible again. */
+        lv_obj_invalidate(s_word_layer);
+        ESP_LOGI(TAG, "View: clock");
+    } else {
+        lv_obj_clear_flag(s_mascot, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_heading, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_clear_flag(s_clock, LV_OBJ_FLAG_HIDDEN);
+        if (view == VIEW_USAGE) {
+            lv_obj_clear_flag(s_mascot_hitbox, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_clock_hitbox, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(s_mascot_hitbox, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_clock_hitbox, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_clear_flag(s_content, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_word_layer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_word_hitbox, LV_OBJ_FLAG_HIDDEN);
+        if (view == VIEW_USAGE) {
+            lv_obj_clear_flag(s_refresh_hitbox, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_settings_hitbox, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_clear_flag(s_settings_label, LV_OBJ_FLAG_HIDDEN);
+            ESP_LOGI(TAG, "View: usage");
+        } else {
+            lv_obj_add_flag(s_refresh_hitbox, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_settings_hitbox, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(s_settings_label, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+}
+
+static void arm_usage_timeout(void)
+{
+    if (s_view == VIEW_USAGE && !s_settings_active && !s_wifi_setup_active &&
+        !s_usage_deadline_us && usage_healthy())
+        s_usage_deadline_us = esp_timer_get_time() + USAGE_VIEW_MS * 1000LL;
+}
+
+static void word_clicked(lv_event_t *event)
+{
+    (void)event;
+    if (s_view != VIEW_CLOCK || s_wifi_setup_active || s_settings_active ||
+        !(usage_healthy() ||
+          (s_manual_clock && s_has_usage && s_time_valid && !s_setup_visible &&
+           !s_boot_active && !s_unknown_usage &&
+           (!s_error[0] || strcmp(s_status_prefix, "Updating") == 0)))) return;
+    s_manual_clock = false;
+    show_view(VIEW_USAGE);
+    s_usage_deadline_us = usage_healthy()
+                              ? esp_timer_get_time() + USAGE_VIEW_MS * 1000LL : 0;
+    refresh(NULL);
+}
+
+static void update_word_clock(int hour, int minute, bool ready)
+{
+    if (s_word_render_hour == hour && s_word_render_minute == minute &&
+        s_word_render_ready == ready) return;
+    s_word_render_hour = hour;
+    s_word_render_minute = minute;
+    s_word_render_ready = ready;
+    word_clock_state_t state;
+    word_clock_compute(hour, minute, ready, &state);
+    for (int i = 0; i < WORD_CLOCK_CELLS; i++)
+        lv_obj_set_style_text_color(s_word_letters[i],
+                                    lv_color_hex(state.active[i] ? TEXT : WORD_INACTIVE), 0);
+    for (int i = 0; i < 4; i++)
+        lv_obj_set_style_bg_color(s_word_dots[i],
+                                  lv_color_hex(i < state.minute_dots ? TEXT : WORD_INACTIVE), 0);
+    if (state.valid) lv_obj_add_flag(s_word_wait, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_clear_flag(s_word_wait, LV_OBJ_FLAG_HIDDEN);
+}
+
+static int word_row_y(int row)
+{
+    return WORD_Y + (row * WORD_ROW_SPAN + (WORD_CLOCK_ROWS - 1) / 2) /
+           (WORD_CLOCK_ROWS - 1);
 }
 
 static void face_eye(lv_obj_t *eye, int height)
@@ -250,6 +485,7 @@ static void stop_face(void)
     lv_obj_set_style_text_color(s_clock, lv_color_hex(TEXT), 0);
     face_eye(s_face_left_eye, FACE_EYE_H);
     face_eye(s_face_right_eye, FACE_EYE_H);
+    arm_usage_timeout();
 }
 
 static void face_tick(lv_timer_t *timer)
@@ -295,6 +531,8 @@ static void face_tick(lv_timer_t *timer)
 static void start_face(void)
 {
     mascot_reset();
+    s_usage_deadline_us = 0;
+    show_view(VIEW_USAGE);
     s_word_started_us = 0;
     s_face_active = true;
     s_face_started_us = esp_timer_get_time();
@@ -306,8 +544,32 @@ static void start_face(void)
     lv_obj_add_flag(s_boot_label, LV_OBJ_FLAG_HIDDEN);
     lv_obj_clear_flag(s_face, LV_OBJ_FLAG_HIDDEN);
     lv_obj_move_foreground(s_clock);
+    lv_obj_move_foreground(s_clock_hitbox);
     lv_timer_reset(s_face_timer);
     lv_timer_resume(s_face_timer);
+}
+
+static void mascot_clicked(lv_event_t *event)
+{
+    (void)event;
+    if (s_view != VIEW_USAGE || s_settings_active || s_wifi_setup_active ||
+        !usage_healthy()) return;
+    start_face();
+}
+
+static void clock_clicked(lv_event_t *event)
+{
+    (void)event;
+    if (s_view != VIEW_USAGE || !s_has_usage || !s_time_valid ||
+        s_boot_active || s_setup_visible || s_settings_active ||
+        s_wifi_setup_active || s_unknown_usage ||
+        (s_error[0] && strcmp(s_status_prefix, "Updating") != 0)) return;
+    int64_t age = (esp_timer_get_time() - s_measured_us) / 1000000;
+    if (age < 0 || age > STALE_SEC) return;
+    if (s_face_active) stop_face();
+    s_manual_clock = true;
+    s_usage_deadline_us = 0;
+    show_view(VIEW_CLOCK);
 }
 
 static void boot_status(const char *message)
@@ -340,6 +602,7 @@ static bool boot_progress(const char *title, const char *detail)
 
 static void clear_content(void)
 {
+    s_setup_name = NULL;
     lv_obj_clean(s_content);
     memset(&s_five, 0, sizeof(s_five));
     memset(&s_week, 0, sizeof(s_week));
@@ -347,61 +610,149 @@ static void clear_content(void)
 
 static void footer(const char *message)
 {
-    /* Two lines of error detail fit above the separate timestamp. */
-    lv_obj_set_y(s_footer, strlen(message) > 48 ? 405 : 418);
+    bool decorative = strncmp(message, "* ", 2) == 0;
+    int baseline = 442 + usage_meta_font.line_height - usage_meta_font.base_line;
+    /* Idle words share the Settings/age baseline; status details stay above it. */
+    lv_obj_set_y(s_footer, decorative
+                              ? baseline - usage_status_font.line_height + usage_status_font.base_line
+                              : strlen(message) > 48 ? 405 : 418);
+    lv_obj_set_height(s_footer, decorative ? usage_status_font.line_height : 34);
     if (strcmp(lv_label_get_text(s_footer), message) != 0)
         lv_label_set_text(s_footer, message);
-    lv_obj_clear_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
+    if (s_view != VIEW_CLOCK)
+        lv_obj_clear_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void footer_clicked(lv_event_t *event)
 {
     (void)event;
+    if (s_view != VIEW_USAGE || s_settings_active || s_wifi_setup_active) return;
     if (!s_has_usage || s_setup_visible || s_updating || s_cycle_inflight ||
         s_refresh_pending || s_face_active || !s_refresh_callback) return;
+    s_usage_deadline_us = 0;
     s_refresh_pending = true;
     if (!s_refresh_callback(s_refresh_context)) s_refresh_pending = false;
     else mascot_reset();
     refresh(NULL);
 }
 
+static void close_settings(bool notify_backend)
+{
+    if (!s_settings_active) return;
+    uint32_t request_id = s_settings_request_id;
+    /* Once OPEN was accepted, the worker may already be committing a new
+     * credential. A rejected CLOSE keeps Back available until it finishes. */
+    if (notify_backend && request_id && s_settings_accepted &&
+        s_settings_callback &&
+        !s_settings_callback(s_settings_context, request_id, false)) return;
+    /* An unavailable OPEN has no session to protect: Back always dismisses it. */
+    if (notify_backend && request_id && !s_settings_accepted && s_settings_callback)
+        (void)s_settings_callback(s_settings_context, request_id, false);
+    s_settings_active = false;
+    s_settings_accepted = false;
+    s_settings_request_id = 0;
+    lv_obj_add_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    if (s_view == VIEW_USAGE && usage_healthy())
+        s_usage_deadline_us = esp_timer_get_time() + USAGE_VIEW_MS * 1000LL;
+    else
+        s_usage_deadline_us = 0;
+}
+
+static void settings_back_clicked(lv_event_t *event)
+{
+    (void)event;
+    close_settings(true);
+    refresh(NULL);
+}
+
+static void settings_clicked(lv_event_t *event)
+{
+    (void)event;
+    if (s_view != VIEW_USAGE || s_settings_active || s_wifi_setup_active ||
+        !s_has_usage || s_setup_visible || s_updating || s_refresh_pending ||
+        s_cycle_inflight || s_boot_active || s_face_active) return;
+    s_settings_request_id = s_settings_sequence == UINT32_MAX
+                                ? 0 : ++s_settings_sequence;
+    s_settings_active = true;
+    s_settings_accepted = false;
+    s_usage_deadline_us = 0;
+    lv_label_set_text(s_settings_title, "Settings");
+    lv_label_set_text(s_settings_detail, "Opening...");
+    lv_obj_add_flag(s_settings_qr_field, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_clear_flag(s_settings_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_settings_overlay);
+    if (!s_settings_request_id || !s_settings_callback ||
+        !s_settings_callback(s_settings_context, s_settings_request_id, true))
+        lv_label_set_text(s_settings_detail, "Settings unavailable");
+    else
+        s_settings_accepted = true;
+}
+
 /* LVGL timer callbacks run on the LVGL task, under the port's own lock. */
 static void refresh(lv_timer_t *timer)
 {
     (void)timer;
+    int hour = -1, minute = -1;
+    bool time_valid = false;
+    time_t now = time(NULL);
     if (s_clock_ready) {
-        time_t now = time(NULL);
         struct tm local;
         if (localtime_r(&now, &local) && local.tm_year >= 125) {
+            hour = local.tm_hour;
+            minute = local.tm_min;
+            time_valid = true;
             char clock[6];
             strftime(clock, sizeof(clock), "%H:%M", &local);
-            lv_label_set_text(s_clock, clock);
+            if (strcmp(lv_label_get_text(s_clock), clock) != 0)
+                lv_label_set_text(s_clock, clock);
         } else {
             lv_label_set_text(s_clock, "--:--");
         }
     } else {
         lv_label_set_text(s_clock, "--:--");
     }
+    s_time_valid = time_valid;
+    update_word_clock(hour, minute, time_valid);
     if (!s_has_usage) return;
-
     int64_t age = (esp_timer_get_time() - s_measured_us) / 1000000;
+    if (s_manual_clock && (age < 0 || age > STALE_SEC ||
+                           !time_valid || s_setup_visible || s_unknown_usage ||
+                           (s_error[0] &&
+                            strcmp(s_status_prefix, "Updating") != 0)))
+        s_manual_clock = false;
+    if (s_view == VIEW_CLOCK && !s_wifi_setup_active && !s_settings_active &&
+        !s_manual_clock && !usage_healthy()) {
+        s_usage_deadline_us = 0;
+        show_view(VIEW_USAGE);
+    }
+
+    bool measurement_age_valid = age >= 0 && age <= STALE_SEC;
     if (age < 0) age = 0;
     bool stale = age > STALE_SEC;
+    bool forecast_fresh = measurement_age_valid && time_valid && !s_error[0] &&
+                          !s_setup_visible;
+    update_forecast_icon(&s_five, now, forecast_fresh, 18000);
+    update_forecast_icon(&s_week, now, forecast_fresh, 604800);
     lv_obj_set_style_bg_opa(s_five.fill, stale ? LV_OPA_50 : LV_OPA_COVER, 0);
     lv_obj_set_style_bg_opa(s_week.fill, stale ? LV_OPA_50 : LV_OPA_COVER, 0);
     char age_text[32];
     display_format_age(age_text, sizeof(age_text), age);
     if (strcmp(lv_label_get_text(s_updated_age), age_text) != 0)
         lv_label_set_text(s_updated_age, age_text);
-    lv_obj_clear_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
+    if (s_view != VIEW_CLOCK)
+        lv_obj_clear_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
 
     char message[96];
     if (s_error[0]) {
         snprintf(message, sizeof(message), "%s: %s", s_status_prefix, s_error);
+    } else if (stale) {
+        snprintf(message, sizeof(message), "%s",
+                 s_updating || s_refresh_pending || s_cycle_inflight
+                     ? "Stale - updating..." : "Stale");
     } else if (s_updating || s_refresh_pending || s_cycle_inflight) {
         snprintf(message, sizeof(message), "Updating...");
-    } else if (stale) {
-        snprintf(message, sizeof(message), "Stale");
+    } else if (!time_valid) {
+        snprintf(message, sizeof(message), "Waiting for time");
     } else if (s_unknown_usage) {
         snprintf(message, sizeof(message), "Unknown");
     } else {
@@ -412,16 +763,23 @@ static void refresh(lv_timer_t *timer)
         snprintf(message, sizeof(message), "%s", s_idle_words[word]);
     }
     if (s_error[0] || s_updating || s_refresh_pending || s_cycle_inflight ||
-        stale || s_unknown_usage || s_boot_active || s_face_active || s_setup_visible)
+        stale || !time_valid || s_unknown_usage || s_boot_active || s_face_active ||
+        s_setup_visible)
         s_word_started_us = 0;
     footer(message);
 
-    char reset[64];
-    time_t now = time(NULL);
-    display_format_reset(reset, sizeof(reset), s_five.reset_iso, now, s_clock_ready);
-    lv_label_set_text(s_five.reset, reset);
-    display_format_reset(reset, sizeof(reset), s_week.reset_iso, now, s_clock_ready);
-    lv_label_set_text(s_week.reset, reset);
+    update_reset_label(s_five.reset, s_five.reset_iso, now, s_clock_ready);
+    update_reset_label(s_week.reset, s_week.reset_iso, now, s_clock_ready);
+    if (s_view == VIEW_USAGE && !s_settings_active && !s_wifi_setup_active) {
+        if (!usage_healthy()) s_usage_deadline_us = 0;
+        else {
+            arm_usage_timeout();
+            if (s_usage_deadline_us && esp_timer_get_time() >= s_usage_deadline_us) {
+                s_usage_deadline_us = 0;
+                show_view(VIEW_CLOCK);
+            }
+        }
+    }
 }
 
 static void status(const char *title, const char *detail)
@@ -441,14 +799,35 @@ static void status(const char *title, const char *detail)
 static card_t create_card(int y, const char *period, uint32_t color)
 {
     card_t c = {0};
-    lv_obj_t *box = rect(s_content, 0, y, W, CARD_H, CARD, 5);
+    lv_obj_t *box = rect(s_content, 0, y, W, CARD_H, BG, 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_CLICKABLE);
     c.value = label(box, &usage_values_font, TEXT, CARD_PAD, 7, 240, "--%");
-    lv_obj_t *pill = rect(box, 284, 15, 132, 34, PILL, 5);
-    lv_obj_t *name = label(pill, &usage_ui_font, TEXT, 0, 4, 132, period);
+    lv_obj_t *name = label(box, &usage_ui_font, TEXT, 284, 19, 132, period);
     lv_obj_set_style_text_align(name, LV_TEXT_ALIGN_CENTER, 0);
-    rect(box, CARD_PAD, 66, BAR_W, 14, TRACK, 3);
-    c.fill = rect(box, CARD_PAD, 66, 0, 14, color, 3);
-    c.reset = label(box, &usage_ui_font, MUTED, CARD_PAD, 94, BAR_W, "Reset unknown");
+    lv_obj_t *icon = icon_container(box);
+    lv_obj_set_pos(icon, 264, 24);
+    c.forecast_headroom = forecast_circle(icon, FORECAST_GREEN);
+    c.forecast_tight = forecast_circle(icon, ORANGE);
+    c.forecast_unknown = forecast_circle(icon, FORECAST_NEUTRAL);
+    lv_obj_add_flag(c.forecast_headroom, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(c.forecast_tight, LV_OBJ_FLAG_HIDDEN);
+    c.fill = rect(box, CARD_PAD, 66, 0, 24, color, 4);
+    lv_obj_clear_flag(c.fill, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *clock = icon_container(box);
+    lv_obj_set_pos(clock, CARD_PAD, 100);
+    lv_obj_t *outline = rect(clock, 0, 0, 16, 16, BG, LV_RADIUS_CIRCLE);
+    lv_obj_set_style_bg_opa(outline, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(outline, 2, 0);
+    lv_obj_set_style_border_color(outline, lv_color_hex(MUTED), 0);
+    lv_obj_set_style_border_opa(outline, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(outline, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *hour_hand = rect(clock, 7, 3, 2, 6, MUTED, 0);
+    lv_obj_t *minute_hand = rect(clock, 7, 7, 5, 2, MUTED, 0);
+    lv_obj_clear_flag(hour_hand, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(minute_hand, LV_OBJ_FLAG_CLICKABLE);
+    c.reset = label(box, &usage_ui_font, MUTED, CARD_PAD + 24, 94,
+                    BAR_W - 24, "Unknown");
     return c;
 }
 
@@ -477,6 +856,7 @@ void display_init(void)
     tzset();
 
     lv_port_sem_take();
+    s_setup_name = NULL;
     lv_obj_t *screen = lv_scr_act();
     lv_obj_remove_style_all(screen);
     lv_obj_set_style_bg_color(screen, lv_color_hex(BG), 0);
@@ -484,8 +864,8 @@ void display_init(void)
     lv_obj_set_style_pad_all(screen, 0, 0);
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     mascot(screen);
-    lv_obj_t *heading = label(screen, &usage_heading_font, TEXT, 139, 25, 200, "Usage");
-    lv_obj_set_style_text_align(heading, LV_TEXT_ALIGN_CENTER, 0);
+    s_heading = label(screen, &usage_heading_font, TEXT, 139, 25, 200, "Usage");
+    lv_obj_set_style_text_align(s_heading, LV_TEXT_ALIGN_CENTER, 0);
     s_clock = label(screen, &usage_ui_font, TEXT, 350, 32, 106, "--:--");
     lv_obj_set_style_text_align(s_clock, LV_TEXT_ALIGN_RIGHT, 0);
 
@@ -498,6 +878,44 @@ void display_init(void)
     lv_obj_set_style_outline_width(s_content, 0, 0);
     lv_obj_set_style_pad_all(s_content, 0, 0);
     lv_obj_clear_flag(s_content, LV_OBJ_FLAG_SCROLLABLE);
+    s_word_layer = lv_obj_create(screen);
+    lv_obj_remove_style_all(s_word_layer);
+    lv_obj_set_size(s_word_layer, 480, 480);
+    lv_obj_set_style_bg_opa(s_word_layer, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(s_word_layer, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    for (int row = 0; row < WORD_CLOCK_ROWS; row++) {
+        const char *cursor = word_clock_rows[row];
+        size_t remaining = strlen(cursor);
+        for (int col = 0; col < WORD_CLOCK_COLS; col++) {
+            int index = row * WORD_CLOCK_COLS + col;
+            char letter[5] = {0};
+            if (remaining > 0) {
+                size_t bytes = _lv_txt_encoded_size(cursor);
+                if (bytes > 0 && bytes <= 4 && bytes <= remaining) {
+                    memcpy(letter, cursor, bytes);
+                    cursor += bytes;
+                    remaining -= bytes;
+                }
+            }
+            lv_obj_t *cell = label(s_word_layer, &usage_ui_font, WORD_INACTIVE,
+                                   WORD_X + (col * WORD_COL_SPAN + WORD_CLOCK_COLS / 2) /
+                                                (WORD_CLOCK_COLS - 1), word_row_y(row),
+                                   WORD_CELL, letter);
+            lv_obj_set_style_text_align(cell, LV_TEXT_ALIGN_CENTER, 0);
+            s_word_letters[index] = cell;
+        }
+    }
+    static const lv_point_t dot_positions[4] = {
+        {12, 12}, {458, 12}, {458, 458}, {12, 458},
+    };
+    for (int i = 0; i < 4; i++) {
+        s_word_dots[i] = rect(s_word_layer, dot_positions[i].x, dot_positions[i].y,
+                              10, 10, WORD_INACTIVE, LV_RADIUS_CIRCLE);
+        lv_obj_clear_flag(s_word_dots[i], LV_OBJ_FLAG_CLICKABLE);
+    }
+    s_word_wait = label(s_word_layer, &usage_ui_font, META, 350, 32, 106, "--:--");
+    lv_obj_set_style_text_align(s_word_wait, LV_TEXT_ALIGN_RIGHT, 0);
+    lv_obj_add_flag(s_word_layer, LV_OBJ_FLAG_HIDDEN);
     s_footer = label(screen, &usage_status_font, ORANGE, 24, 418, W, "");
     lv_obj_set_style_text_align(s_footer, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_long_mode(s_footer, LV_LABEL_LONG_WRAP);
@@ -509,11 +927,28 @@ void display_init(void)
     lv_obj_add_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
     s_refresh_hitbox = lv_obj_create(screen);
     lv_obj_remove_style_all(s_refresh_hitbox);
-    lv_obj_set_pos(s_refresh_hitbox, 24, 405);
-    lv_obj_set_size(s_refresh_hitbox, W, 51);
+    lv_obj_set_pos(s_refresh_hitbox, 112, 405);
+    lv_obj_set_size(s_refresh_hitbox, 344, 51);
     lv_obj_clear_flag(s_refresh_hitbox, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_flag(s_refresh_hitbox, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(s_refresh_hitbox, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_event_cb(s_refresh_hitbox, footer_clicked, LV_EVENT_CLICKED, NULL);
+    s_settings_label = label(screen, &usage_meta_font, META, 24, 442, 84, "Settings");
+    lv_obj_add_flag(s_settings_label, LV_OBJ_FLAG_HIDDEN);
+    s_settings_hitbox = lv_obj_create(screen);
+    lv_obj_remove_style_all(s_settings_hitbox);
+    lv_obj_set_pos(s_settings_hitbox, 24, 416);
+    lv_obj_set_size(s_settings_hitbox, 84, 48);
+    lv_obj_set_style_bg_opa(s_settings_hitbox, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(s_settings_hitbox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_settings_hitbox, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_settings_hitbox, settings_clicked, LV_EVENT_CLICKED, NULL);
+    s_word_hitbox = lv_obj_create(screen);
+    lv_obj_remove_style_all(s_word_hitbox);
+    lv_obj_set_size(s_word_hitbox, 480, 480);
+    lv_obj_set_style_bg_opa(s_word_hitbox, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(s_word_hitbox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_word_hitbox, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_word_hitbox, word_clicked, LV_EVENT_CLICKED, NULL);
 
     /* Separate screen child: clearing card content never destroys the face. */
     s_face = rect(screen, 0, 0, 480, 480, ORANGE, 0);
@@ -530,10 +965,54 @@ void display_init(void)
     s_face_started_us = esp_timer_get_time();
     lv_obj_set_style_text_color(s_clock, lv_color_hex(FACE_INK), 0);
     lv_obj_move_foreground(s_clock);
+    /* Fixed targets stay put while the mascot moves. Keep the clock target
+     * above the face, with the Settings and Wi-Fi overlays created later. */
+    s_mascot_hitbox = lv_obj_create(screen);
+    lv_obj_remove_style_all(s_mascot_hitbox);
+    lv_obj_set_pos(s_mascot_hitbox, 24, 24);
+    lv_obj_set_size(s_mascot_hitbox, 80, 56);
+    lv_obj_set_style_bg_opa(s_mascot_hitbox, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(s_mascot_hitbox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_mascot_hitbox, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_mascot_hitbox, mascot_clicked, LV_EVENT_CLICKED, NULL);
+    s_clock_hitbox = lv_obj_create(screen);
+    lv_obj_remove_style_all(s_clock_hitbox);
+    lv_obj_set_pos(s_clock_hitbox, 350, 24);
+    lv_obj_set_size(s_clock_hitbox, 106, 56);
+    lv_obj_set_style_bg_opa(s_clock_hitbox, LV_OPA_TRANSP, 0);
+    lv_obj_clear_flag(s_clock_hitbox, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_clock_hitbox, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_clock_hitbox, clock_clicked, LV_EVENT_CLICKED, NULL);
     status("Starting", "Connecting to Claude...");
     lv_timer_create(refresh, 1000, NULL);
     lv_timer_create(mascot_tick, MASCOT_TICK_MS, NULL);
     s_face_timer = lv_timer_create(face_tick, FACE_TICK_MS, NULL);
+
+    s_settings_overlay = create_qr_overlay(screen, &s_settings_title,
+                                            &s_settings_detail, &s_settings_qr_field,
+                                            &s_settings_qr, &s_settings_name);
+    lv_obj_t *back = rect(s_settings_overlay, 24, 416, 96, 48, CARD, 5);
+    lv_obj_add_event_cb(back, settings_back_clicked, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *back_label = label(back, &usage_status_font, TEXT, 0, 15, 96, "Back");
+    lv_obj_set_style_text_align(back_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_clear_flag(back_label, LV_OBJ_FLAG_CLICKABLE);
+
+    s_wifi_overlay = create_qr_overlay(screen, &s_wifi_title,
+                                        &s_wifi_detail, &s_wifi_qr_field, &s_wifi_qr,
+                                        &s_wifi_name);
+    lv_port_sem_give();
+}
+
+void display_set_device_name(const char *name)
+{
+    if (!name || strlen(name) != 14 || strncmp(name, "hello-box-", 10) != 0) return;
+    for (int i = 10; i < 14; ++i)
+        if (name[i] < '0' || name[i] > '9') return;
+    lv_port_sem_take();
+    memcpy(s_device_name, name, sizeof(s_device_name));
+    if (s_settings_name) lv_label_set_text(s_settings_name, s_device_name);
+    if (s_wifi_name) lv_label_set_text(s_wifi_name, s_device_name);
+    if (s_setup_name) lv_label_set_text(s_setup_name, s_device_name);
     lv_port_sem_give();
 }
 
@@ -551,6 +1030,8 @@ void display_status(const char *title, const char *detail)
                             (detail && strstr(detail, "Waiting for clock"));
     bool usage_retry = title && strcmp(title, "Usage") == 0 && detail &&
                        strstr(detail, "Retrying after cooldown");
+    if (!(refreshing && s_manual_clock && s_cycle_inflight)) s_manual_clock = false;
+    s_usage_deadline_us = 0;
     if (!refreshing) {
         s_updating = false;
         s_refresh_pending = false;
@@ -558,6 +1039,7 @@ void display_status(const char *title, const char *detail)
         stop_face();
     }
     if (s_has_usage) {
+        if (!s_manual_clock) show_view(VIEW_USAGE);
         snprintf(s_error, sizeof(s_error), "%s", detail && *detail ? detail :
                  (title && *title ? title : "Update failed"));
         s_status_prefix = title && strstr(title, "Wi-Fi")
@@ -568,6 +1050,7 @@ void display_status(const char *title, const char *detail)
         refresh(NULL);
     } else {
         s_setup_visible = false;
+        show_view(VIEW_STATUS);
         status(title, detail);
     }
     lv_port_sem_give();
@@ -584,7 +1067,10 @@ void display_setup(const char *url)
     s_setup_visible = true;
     s_refresh_pending = false;
     s_cycle_inflight = false;
+    s_manual_clock = false;
+    s_usage_deadline_us = 0;
     stop_face();
+    show_view(VIEW_STATUS);
     if (!url || !*url) {
         status("Connect Claude", "Setup link unavailable. Check Wi-Fi.");
         lv_port_sem_give();
@@ -594,6 +1080,9 @@ void display_setup(const char *url)
     lv_obj_add_flag(s_footer, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(s_updated_age, LV_OBJ_FLAG_HIDDEN);
     label(s_content, &usage_ui_font, TEXT, 0, 0, W, "Connect Claude");
+    s_setup_name = label(s_content, &usage_meta_font, META, 0, 30, W,
+                         s_device_name);
+    lv_obj_set_style_text_align(s_setup_name, LV_TEXT_ALIGN_CENTER, 0);
     /* White 252 px field, 192 px code, 30 px quiet zone on each side. */
     lv_obj_t *field = rect(s_content, 90, 50, 252, 252, 0xFFFFFF, 0);
     lv_obj_t *qr = lv_qrcode_create(field, 192, lv_color_hex(BG), lv_color_hex(0xFFFFFF));
@@ -609,10 +1098,80 @@ void display_setup(const char *url)
     lv_port_sem_give();
 }
 
+void display_set_settings_callback(display_settings_callback_t callback, void *context)
+{
+    lv_port_sem_take();
+    if (!callback) close_settings(false);
+    s_settings_callback = callback;
+    s_settings_context = context;
+    lv_port_sem_give();
+}
+
+void display_settings_qr(uint32_t request_id, const char *url)
+{
+    lv_port_sem_take();
+    if (s_settings_active && s_settings_accepted &&
+        request_id == s_settings_request_id &&
+        !s_wifi_setup_active) {
+        lv_label_set_text(s_settings_detail, "Scan with your phone");
+        overlay_qr(s_settings_qr_field, s_settings_qr, s_settings_detail,
+                   url, "Settings unavailable");
+    }
+    lv_port_sem_give();
+}
+
+void display_settings_closed(uint32_t request_id)
+{
+    lv_port_sem_take();
+    if (s_settings_active && request_id == s_settings_request_id)
+        close_settings(false);
+    lv_port_sem_give();
+}
+
+void display_wifi_setup(const char *join_qr, const char *page_url,
+                        bool phone_joined, const char *message)
+{
+    lv_port_sem_take();
+    if (!s_wifi_setup_active) {
+        s_wifi_setup_active = true;
+        s_manual_clock = false;
+        if (s_has_usage && s_view == VIEW_CLOCK) show_view(VIEW_USAGE);
+        close_settings(false);
+        s_usage_deadline_us = 0;
+        s_boot_active = false;
+        stop_face();
+    }
+    lv_label_set_text(s_wifi_title,
+                      phone_joined ? "Open Wi-Fi setup" : "Join setup Wi-Fi");
+    lv_label_set_text(s_wifi_detail,
+                      message && *message ? message :
+                      phone_joined ? "Scan to open setup" : "Scan to join setup Wi-Fi");
+    overlay_qr(s_wifi_qr_field, s_wifi_qr, s_wifi_detail,
+               phone_joined ? page_url : join_qr, "Setup QR unavailable");
+    lv_obj_clear_flag(s_wifi_overlay, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(s_wifi_overlay);
+    lv_port_sem_give();
+}
+
+void display_wifi_setup_done(void)
+{
+    lv_port_sem_take();
+    if (s_wifi_setup_active) {
+        s_wifi_setup_active = false;
+        lv_obj_add_flag(s_wifi_overlay, LV_OBJ_FLAG_HIDDEN);
+        if (s_view == VIEW_USAGE && usage_healthy())
+            s_usage_deadline_us = esp_timer_get_time() + USAGE_VIEW_MS * 1000LL;
+        refresh(NULL);
+    }
+    lv_port_sem_give();
+}
+
 void display_usage(float five_used, const char *five_reset,
                    float week_used, const char *week_reset)
 {
     lv_port_sem_take();
+    bool recovering = !s_boot_active && !s_face_active &&
+                      (!s_has_usage || s_setup_visible || s_error[0]);
     if (!s_has_usage) {
         clear_content();
         s_five = create_card(0, "5h left", ORANGE);
@@ -620,13 +1179,22 @@ void display_usage(float five_used, const char *five_reset,
     }
     update_card(&s_five, five_used, five_reset);
     update_card(&s_week, week_used, week_reset);
+    int64_t sampled_at = s_clock_ready && s_time_valid ? (int64_t)time(NULL) : 0;
+    s_five.utilized = five_used;
+    s_week.utilized = week_used;
+    s_five.sampled_at = sampled_at;
+    s_week.sampled_at = sampled_at;
     s_measured_us = esp_timer_get_time();
     s_unknown_usage = !isfinite(five_used) || five_used < 0.0f || five_used > 100.0f ||
                       !isfinite(week_used) || week_used < 0.0f || week_used > 100.0f;
+    if (s_unknown_usage) s_manual_clock = false;
     s_has_usage = true;
     s_setup_visible = false;
     s_updating = false;
     s_error[0] = '\0';
+    if (!s_manual_clock) show_view(VIEW_USAGE);
+    if (recovering && !s_manual_clock &&
+        !s_settings_active && !s_wifi_setup_active) start_face();
     if (s_boot_active && !s_boot_ready) {
         s_boot_ready = true;
         int64_t earliest = s_face_started_us + (FACE_MS - FACE_FADE_OUT_MS) * 1000LL;
@@ -665,8 +1233,10 @@ void display_refresh_cycle_begin(void)
     mascot_reset();
     s_refresh_pending = false;
     if (!s_cycle_inflight) {
+        s_manual_clock = false;
         s_cycle_inflight = true;
-        if (s_has_usage && !s_setup_visible && !s_face_active) start_face();
+        if (s_has_usage && !s_setup_visible && !s_face_active &&
+            !s_settings_active && !s_wifi_setup_active) start_face();
     }
     lv_port_sem_give();
 }

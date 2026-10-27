@@ -11,7 +11,7 @@ def main():
     parser.add_argument("--seconds", type=int, default=30)
     parser.add_argument("--no-reset", action="store_true", help="Watch filtered diagnostics without restarting the monitor")
     args = parser.parse_args()
-    allowed = re.compile(r"(?:probe_app|oauth_probe|display_check|indev_tp|app_init|cpu_start|bsp boards|board sensecap|bsp_lcd|esp_psram):|Guru Meditation|assert failed|Brownout")
+    allowed = re.compile(r"(?:probe_app|oauth_probe|wifi_manager|display_ui|display_check|indev_tp|app_init|cpu_start|bsp boards|board sensecap|bsp_lcd|esp_psram):|Guru Meditation|assert failed|Brownout")
     ansi = re.compile(r"\x1b\[[0-9;]*m")
     with serial.Serial(args.port, 115200, timeout=0.5, dsrdtr=False, rtscts=False) as port:
         if not args.no_reset:

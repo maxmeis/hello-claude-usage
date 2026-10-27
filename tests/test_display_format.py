@@ -31,6 +31,10 @@ class DisplayFormatTests(unittest.TestCase):
         cls.lib.display_format_age.restype = None
         cls.lib.display_quota_color.argtypes = [ctypes.c_float]
         cls.lib.display_quota_color.restype = ctypes.c_uint32
+        cls.lib.display_forecast.argtypes = [ctypes.c_float, ctypes.c_char_p,
+                                             ctypes.c_int64, ctypes.c_int64,
+                                             ctypes.c_int64, ctypes.c_bool]
+        cls.lib.display_forecast.restype = ctypes.c_int
 
     @classmethod
     def tearDownClass(cls):
@@ -137,6 +141,70 @@ class DisplayFormatTests(unittest.TestCase):
         for remaining in [-1.0, 100.01, float("nan"), float("inf"), -float("inf")]:
             with self.subTest(remaining=remaining):
                 self.assertEqual(self.lib.display_quota_color(remaining), 0x5D625E)
+
+    def forecast(self, utilized, reset_iso=b"2026-10-27T04:00:00Z",
+                 window_seconds=18000, sampled_at=None, now=None, fresh=True):
+        reset = calendar.timegm(datetime(2026, 10, 27, 4).timetuple())
+        if sampled_at is None:
+            sampled_at = reset - window_seconds // 2
+        if now is None:
+            now = sampled_at
+        return self.lib.display_forecast(utilized, reset_iso, window_seconds,
+                                         sampled_at, now, fresh)
+
+    def test_five_hour_forecast_uses_eighty_percent_projected_threshold(self):
+        # Halfway through the window, 40% utilized projects to 80% at reset.
+        for utilized, expected in [(39.0, 1), (40.0, 2), (41.0, 2),
+                                   (100.0, 2), (0.0, 0)]:
+            with self.subTest(utilized=utilized):
+                self.assertEqual(self.forecast(utilized), expected)
+
+    def test_weekly_forecast_uses_the_same_window_average(self):
+        for utilized, expected in [(30.0, 1), (40.0, 2), (50.0, 2)]:
+            with self.subTest(utilized=utilized):
+                self.assertEqual(self.forecast(utilized, window_seconds=604800), expected)
+
+    def test_projection_remains_anchored_to_sample_time(self):
+        reset = calendar.timegm(datetime(2026, 10, 27, 4).timetuple())
+        sampled_at = reset - 9000
+        for now in [sampled_at, sampled_at + 450, sampled_at + 900]:
+            with self.subTest(now=now):
+                self.assertEqual(self.forecast(39.0, sampled_at=sampled_at, now=now), 1)
+                self.assertEqual(self.forecast(40.0, sampled_at=sampled_at, now=now), 2)
+
+    def test_warmup_and_staleness_boundaries(self):
+        reset = calendar.timegm(datetime(2026, 10, 27, 4).timetuple())
+        start = reset - 18000
+        for elapsed, expected in [(0, 0), (299, 0), (300, 2)]:
+            with self.subTest(elapsed=elapsed):
+                self.assertEqual(self.forecast(100.0, sampled_at=start + elapsed), expected)
+        sampled_at = start + 9000
+        self.assertEqual(self.forecast(40.0, sampled_at=sampled_at, now=sampled_at + 900), 2)
+        self.assertEqual(self.forecast(40.0, sampled_at=sampled_at, now=sampled_at + 901), 0)
+
+    def test_invalid_inputs_and_time_states_are_unknown(self):
+        reset = calendar.timegm(datetime(2026, 10, 27, 4).timetuple())
+        sample = reset - 9000
+        cases = [
+            dict(fresh=False), dict(utilized=-1.0), dict(utilized=100.01),
+            dict(utilized=float("nan")), dict(utilized=float("inf")),
+            dict(utilized=-float("inf")), dict(reset_iso=None),
+            dict(reset_iso=b"invalid"), dict(window_seconds=0),
+            dict(window_seconds=-18000), dict(window_seconds=3600),
+            dict(sampled_at=0), dict(sampled_at=-1),
+            dict(sampled_at=sample, now=sample - 1),
+            dict(sampled_at=reset - 18001),  # inferred start is still ahead
+            dict(sampled_at=sample, now=reset),
+            dict(sampled_at=sample, now=reset + 1),
+            dict(sampled_at=(1 << 63) - 1, now=(1 << 63) - 1),
+            dict(sampled_at=sample, now=(1 << 63) - 1),
+            dict(sampled_at=-(1 << 63), now=(1 << 63) - 1),
+        ]
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                params = dict(utilized=40.0, sampled_at=sample)
+                params.update(overrides)
+                self.assertEqual(self.forecast(**params), 0)
 
 
 if __name__ == "__main__":

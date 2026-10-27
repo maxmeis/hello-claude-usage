@@ -21,12 +21,24 @@ LVGL = ROOT / ".deps" / "sensecap-sdk" / "components" / "lvgl"
 EXE = ROOT / ".deps" / "native-ui"
 OUTPUT = ROOT / "build" / "previews"
 SCENES = ("usage", "usage-full", "unknown", "offline", "setup", "updating", "error", "disconnected",
+          "forecast", "forecast-preclock",
           "face-refresh", "boot", "boot-slow", "boot-interrupt", "mascot-motion",
           "mascot-pause-setup", "mascot-pause-error", "mascot-pause-offline",
           "mascot-pause-updating", "mascot-pause-fullface", "mascot-pause-stale",
-          "mascot-pause-tap", "footer-words", "footer-minute", "footer-error")
+          "mascot-pause-tap", "footer-words", "footer-minute", "footer-error",
+          "clock-normal", "clock-quarter", "clock-half", "clock-rollover",
+          "clock-unready", "clock-cycle", "clock-attention", "clock-five", "clock-midnight",
+          "settings-flow", "wifi-flow", "header-actions")
 FACE_FRAMES = ("open", "both-closed", "wink", "done")
 BOOT_FRAMES = ("boot-open", "boot-status", "boot-done")
+CLOCK_CYCLE_FRAMES = ("clock", "face", "dashboard", "return")
+SETTINGS_FRAMES = ("pending", "qr", "unavailable", "return")
+WIFI_FRAMES = ("join", "page", "done")
+HEADER_ACTION_FRAMES = ("dashboard", "mascot-open", "mascot-wink", "manual-clock",
+                        "inflight-clock", "return-dashboard", "stale-dashboard",
+                        "stale-inflight")
+FORECAST_FRAMES = ("headroom", "tight", "unknown-week", "unknown-five", "mixed", "zero", "early", "missing",
+                   "stale", "error", "expired")
 
 
 def chunk(kind: bytes, data: bytes) -> bytes:
@@ -50,6 +62,7 @@ def build(sanitize: bool) -> None:
         raise SystemExit("LVGL SDK absent; run scripts/fetch-sdk.sh first")
     sources = sorted((LVGL / "src").rglob("*.c"))
     sources += [ROOT / "main" / "display.c", ROOT / "main" / "display_format.c",
+                ROOT / "main" / "word_clock.c",
                 ROOT / "main" / "usage_heading_font.c", ROOT / "main" / "usage_values_font.c",
                 ROOT / "main" / "usage_ui_font.c", ROOT / "main" / "usage_status_font.c",
                 ROOT / "main" / "usage_meta_font.c",
@@ -120,12 +133,39 @@ def main() -> None:
                 ppm.unlink()
                 print(png.relative_to(ROOT))
             continue
+        if scene == "forecast":
+            base = OUTPUT / "forecast"
+            subprocess.run([str(EXE), scene, f"{base}.ppm"], check=True, cwd=ROOT)
+            for phase in FORECAST_FRAMES:
+                ppm = OUTPUT / f"forecast-{phase}.ppm"
+                png = ppm.with_suffix(".png")
+                ppm_to_png(ppm, png)
+                ppm.unlink()
+                print(png.relative_to(ROOT))
+            continue
         if scene == "boot":
             base = OUTPUT / "boot"
             subprocess.run([str(EXE), scene, f"{base}.ppm"], check=True, cwd=ROOT)
             for phase in BOOT_FRAMES:
                 ppm = OUTPUT / f"{phase}.ppm"
                 png = OUTPUT / f"{phase}.png"
+                ppm_to_png(ppm, png)
+                ppm.unlink()
+                print(png.relative_to(ROOT))
+            continue
+        if scene in ("clock-cycle", "settings-flow", "wifi-flow", "header-actions"):
+            base = OUTPUT / "clock-cycle"
+            phases = CLOCK_CYCLE_FRAMES
+            if scene == "settings-flow":
+                base, phases = OUTPUT / "settings", SETTINGS_FRAMES
+            elif scene == "wifi-flow":
+                base, phases = OUTPUT / "wifi", WIFI_FRAMES
+            elif scene == "header-actions":
+                base, phases = OUTPUT / "header-actions", HEADER_ACTION_FRAMES
+            subprocess.run([str(EXE), scene, f"{base}.ppm"], check=True, cwd=ROOT)
+            for phase in phases:
+                ppm = OUTPUT / f"{base.name}-{phase}.ppm"
+                png = OUTPUT / f"{base.name}-{phase}.png"
                 ppm_to_png(ppm, png)
                 ppm.unlink()
                 print(png.relative_to(ROOT))
