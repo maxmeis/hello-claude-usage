@@ -1,0 +1,4 @@
+hello-box firmware includes ESP-IDF and Seeed SenseCAP SDK components under their upstream licenses, LVGL under MIT, and generated Lato and Bree Serif fonts under the included SIL Open Font Licenses.
+Source: https://github.com/maxmeis/hello-claude-usage
+ESP-IDF: https://github.com/espressif/esp-idf/tree/v5.1.1
+LVGL: https://github.com/lvgl/lvgl/tree/v8.3.1

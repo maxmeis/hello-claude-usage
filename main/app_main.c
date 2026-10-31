@@ -4,10 +4,14 @@
 #include "nvs_flash.h"
 
 #include "display.h"
+#include "box_config_store.h"
 #include "device_identity.h"
 #include "factory_reset.h"
 #include "oauth_probe.h"
+#include "codex_adapter.h"
+#include "provider_http.h"
 #include "wifi_manager.h"
+#include "usb_management.h"
 
 #if __has_include("provision.h")
 #include "provision.h"
@@ -22,12 +26,10 @@ static const char *TAG = "probe_app";
 
 void app_main(void)
 {
-    display_init();
-    ESP_LOGI(TAG, "Display ready (480x480); Usage monitor RGB565");
-    display_status("Starting", "Connecting to Wi-Fi...");
     esp_err_t err = nvs_flash_init();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "NVS init failed: %s", esp_err_to_name(err));
+        display_init();
         display_status("Storage error", "Check device storage");
         return;
     }
@@ -35,9 +37,20 @@ void app_main(void)
     err = factory_reset_prepare_boot();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Factory reset preparation failed: %s", esp_err_to_name(err));
+        display_init();
         display_status("Storage error", "Reset could not finish");
         return;
     }
+
+    err = box_config_init();
+    display_init();
+    ESP_LOGI(TAG, "Display ready (480x480); Usage monitor RGB565");
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Installer configuration unavailable: %s", esp_err_to_name(err));
+        display_status("Storage error", "Could not apply installer settings");
+        return;
+    }
+    display_status("Starting", "Connecting to Wi-Fi...");
 
     err = device_identity_init();
     if (err != ESP_OK) {
@@ -57,5 +70,13 @@ void app_main(void)
         display_status("Wi-Fi error", "Network setup unavailable");
         return;
     }
+    if (!provider_http_init()) {
+        display_status("Network error", "Provider request queue unavailable");
+        return;
+    }
     oauth_probe_start(wifi_events, sta);
+    codex_adapter_start(wifi_events);
+    if (!usb_management_start()) {
+        ESP_LOGE(TAG, "USB management unavailable");
+    }
 }

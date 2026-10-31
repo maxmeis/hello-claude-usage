@@ -15,6 +15,31 @@ REFERENCE_GRID = (
     "ESKISTAFÜNFZEHNZWANZIGDREIVIERTELVORFUNKNACHHALBAELFÜNFEINSXÄM"
     "ZWEIDREIAUJVIERSECHSNLACHTSIEBENZWÖLFZEHNEUNKUHR"
 )
+ENGLISH_ROWS = (
+    "ITLISASTIME", "ACQUARTERDC", "TWENTYFIVEX", "HALFBTENFTO",
+    "PASTERUNINE", "ONESIXTHREE", "FOURFIVETWO", "EIGHTELEVEN",
+    "SEVENTWELVE", "TENSEOCLOCK",
+)
+ENGLISH_WORDS = {
+    "IT": (0, 0, 2), "IS": (0, 3, 2), "A": (1, 0, 1),
+    "QUARTER": (1, 2, 7), "TWENTY": (2, 0, 6),
+    "FIVE_MIN": (2, 6, 4), "HALF": (3, 0, 4),
+    "TEN_MIN": (3, 5, 3), "TO": (3, 9, 2), "PAST": (4, 0, 4),
+    "ONE": (5, 0, 3), "SIX": (5, 3, 3), "THREE": (5, 6, 5),
+    "FOUR": (6, 0, 4), "FIVE": (6, 4, 4), "TWO": (6, 8, 3),
+    "EIGHT": (7, 0, 5), "ELEVEN": (7, 5, 6),
+    "SEVEN": (8, 0, 5), "TWELVE": (8, 5, 6),
+    "NINE": (4, 7, 4), "TEN": (9, 0, 3), "OCLOCK": (9, 5, 6),
+}
+ENGLISH_HOURS = ("TWELVE", "ONE", "TWO", "THREE", "FOUR", "FIVE", "SIX",
+                 "SEVEN", "EIGHT", "NINE", "TEN", "ELEVEN")
+ENGLISH_MINUTES = (
+    ("OCLOCK",), ("FIVE_MIN", "PAST"), ("TEN_MIN", "PAST"),
+    ("A", "QUARTER", "PAST"), ("TWENTY", "PAST"),
+    ("TWENTY", "FIVE_MIN", "PAST"), ("HALF", "PAST"),
+    ("TWENTY", "FIVE_MIN", "TO"), ("TWENTY", "TO"),
+    ("A", "QUARTER", "TO"), ("TEN_MIN", "TO"), ("FIVE_MIN", "TO"),
+)
 
 
 class WordClockState(ctypes.Structure):
@@ -93,6 +118,13 @@ class WordClockTests(unittest.TestCase):
             ctypes.POINTER(WordClockState),
         ]
         cls.lib.word_clock_compute.restype = None
+        cls.lib.word_clock_compute_language.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_bool, ctypes.c_uint8,
+            ctypes.POINTER(WordClockState),
+        ]
+        cls.lib.word_clock_compute_language.restype = None
+        cls.lib.word_clock_rows_for_language.argtypes = [ctypes.c_uint8]
+        cls.lib.word_clock_rows_for_language.restype = ctypes.POINTER(ctypes.c_char_p)
         cls.rows = [row.decode("utf-8") for row in
                     (ctypes.c_char_p * ROWS).in_dll(cls.lib, "word_clock_rows")]
 
@@ -178,6 +210,45 @@ class WordClockTests(unittest.TestCase):
                 self.assertEqual(state.minute_dots, 0)
                 self.assertEqual(self.active_cells(state), set())
         self.lib.word_clock_compute(12, 30, True, None)
+
+    def test_english_grid_and_all_1440_minutes(self):
+        rows = self.lib.word_clock_rows_for_language(1)
+        self.assertEqual(tuple(rows[i].decode() for i in range(ROWS)), ENGLISH_ROWS)
+        grid = "".join(ENGLISH_ROWS)
+        for name, (row, col, length) in ENGLISH_WORDS.items():
+            self.assertEqual(grid[row * COLS + col:row * COLS + col + length],
+                             name.replace("_MIN", ""))
+        for hour in range(24):
+            for minute in range(60):
+                state = WordClockState()
+                self.lib.word_clock_compute_language(hour, minute, True, 1,
+                                                     ctypes.byref(state))
+                slot = minute // 5
+                shown_hour = (hour + (slot >= 7)) % 12
+                words = ("IT", "IS", *ENGLISH_MINUTES[slot],
+                         ENGLISH_HOURS[shown_hour])
+                expected = {row * COLS + col + offset
+                            for word in words
+                            for row, col, length in (ENGLISH_WORDS[word],)
+                            for offset in range(length)}
+                self.assertTrue(state.valid)
+                self.assertEqual(state.minute_dots, minute % 5)
+                self.assertEqual(self.active_cells(state), expected,
+                                 (hour, minute))
+
+    def test_language_fallback_and_invalid_english_input(self):
+        self.assertEqual([self.lib.word_clock_rows_for_language(255)[i].decode()
+                          for i in range(ROWS)], self.rows)
+        german = self.compute(10, 31)
+        fallback = WordClockState()
+        self.lib.word_clock_compute_language(10, 31, True, 255,
+                                             ctypes.byref(fallback))
+        self.assertEqual(self.active_cells(german), self.active_cells(fallback))
+        invalid = WordClockState()
+        self.lib.word_clock_compute_language(24, 0, True, 1,
+                                             ctypes.byref(invalid))
+        self.assertFalse(invalid.valid)
+        self.assertEqual(self.active_cells(invalid), set())
 
 
 if __name__ == "__main__":

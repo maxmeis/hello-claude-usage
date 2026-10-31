@@ -21,6 +21,12 @@
 #include "lv_port.h"
 #include "sdkconfig.h"
 
+#ifdef ESP_PLATFORM
+#include "driver/gpio.h"
+#include "driver/ledc.h"
+#include "esp_log.h"
+#endif
+
 #if CONFIG_LCD_AVOID_TEAR || CONFIG_LCD_LVGL_DIRECT_MODE
 #include "esp_cache.h"
 #endif
@@ -33,6 +39,48 @@ static lv_disp_drv_t s_disp_drv;
 static lv_indev_drv_t s_indev_drv;
 static SemaphoreHandle_t s_lvgl_mutex;
 static TaskHandle_t s_lvgl_task;
+
+void lv_port_set_brightness(uint8_t percent)
+{
+#ifdef ESP_PLATFORM
+    const board_res_desc_t *board = bsp_board_get_description();
+    if (board->GPIO_LCD_BL == GPIO_NUM_NC) return;
+    if (percent < 20 || percent > 100) percent = 100;
+    if (percent == 100) {
+        ESP_ERROR_CHECK(bsp_lcd_set_backlight(true));
+        return;
+    }
+
+    /* The SenseCAP BSP initializes this pin as a GPIO. A separate LEDC
+     * timer/channel avoids the BSP's optional RGB LED channels 0..2. */
+    const ledc_timer_config_t timer = {
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_3,
+        .duty_resolution = LEDC_TIMER_10_BIT,
+        .freq_hz = 20000,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    uint32_t duty = (1023u * (board->GPIO_LCD_BL_ON ? percent : 100u - percent) + 50u) / 100u;
+    const ledc_channel_config_t channel = {
+        .gpio_num = board->GPIO_LCD_BL,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .channel = LEDC_CHANNEL_7,
+        .intr_type = LEDC_INTR_DISABLE,
+        .timer_sel = LEDC_TIMER_3,
+        .duty = duty,
+        .hpoint = 0,
+    };
+    esp_err_t err = ledc_timer_config(&timer);
+    if (err == ESP_OK) err = ledc_channel_config(&channel);
+    if (err != ESP_OK) {
+        ESP_LOGW("lv_port", "Backlight PWM unavailable (%s); using full brightness",
+                 esp_err_to_name(err));
+        ESP_ERROR_CHECK(bsp_lcd_set_backlight(true));
+    }
+#else
+    (void)percent;
+#endif
+}
 
 static void touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data)
 {

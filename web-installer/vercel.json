@@ -1,0 +1,21 @@
+{
+  "framework": "vite",
+  "buildCommand": "node scripts/prepare-release.mjs && node node_modules/vite/bin/vite.js build",
+  "outputDirectory": "dist",
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        {"key": "X-Content-Type-Options", "value": "nosniff"},
+        {"key": "Referrer-Policy", "value": "no-referrer"},
+        {"key": "Permissions-Policy", "value": "serial=(self)"},
+        {"key": "Cross-Origin-Opener-Policy", "value": "same-origin"},
+        {"key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; form-action 'none'; frame-ancestors 'none'"}
+      ]
+    },
+    {
+      "source": "/firmware/(.*)",
+      "headers": [{"key": "Cache-Control", "value": "no-cache"}]
+    }
+  ]
+}

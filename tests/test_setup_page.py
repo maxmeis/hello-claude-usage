@@ -99,6 +99,8 @@ class SetupPageRegressionTests(unittest.TestCase):
         links = [attrs for tag, attrs in self.parsed.tags if tag == "a"]
         self.assertEqual(len(links), 1, "expected one Claude authorization link")
         self.assertEqual(links[0].get("href"), self.auth_url)
+        self.assertEqual(links[0].get("target"), "_blank",
+                         "Claude sign-in must leave the local code-entry page open")
         self.assertIn("noreferrer", links[0].get("rel", "").split())
         self.assertIn("noopener", links[0].get("rel", "").split())
         self.assertEqual(len(self.parsed.textareas), 1, "OAuth code input textarea is missing")
@@ -131,6 +133,7 @@ class SetupPageRegressionTests(unittest.TestCase):
         self.assertEqual(result.get("role"), "status")
         self.assertEqual(result.get("aria-live"), "polite")
         self.assertIn("Get a sign-in code", self.page)
+        self.assertIn("in a new tab", self.page)
         self.assertIn("Paste the full code, including #state", self.page)
         self.assertLess(self.page.index("account-title"), self.page.index("wifi-title"))
         self.assertLess(self.page.index("wifi-title"), self.page.index("reset-section-title"))

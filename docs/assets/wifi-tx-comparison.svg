@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="410" viewBox="0 0 880 410" role="img" aria-labelledby="title desc">
+  <title id="title">Matched Wi-Fi tests: WPA callback counts</title>
+  <desc id="desc">At a configured TX ceiling of 20 dBm, the matched run had zero receive and zero send callbacks and failed with reason 204. At a 7 dBm ceiling, the matched run had two receive and two send callbacks and obtained an IP address. These are individual runs and software callback counts, not measured RF output or success probabilities.</desc>
+  <rect width="880" height="410" fill="#ffffff"/>
+  <g font-family="system-ui, -apple-system, sans-serif" fill="#17201c">
+    <text x="32" y="38" font-size="24" font-weight="700">The matched TX-ceiling comparison</text>
+    <text x="32" y="66" font-size="15" fill="#52615a">Same station, target AP, confirmed key and SDK 5.1.1 · 30 October 2026</text>
+    <g stroke="#dce3de" stroke-width="1">
+      <path d="M310 114V316 M510 114V316 M710 114V316"/>
+    </g>
+    <g font-size="13" fill="#52615a" text-anchor="middle">
+      <text x="310" y="104">0</text><text x="510" y="104">1</text><text x="710" y="104">2 callbacks</text>
+    </g>
+    <text x="32" y="152" font-size="19" font-weight="700">Original ceiling: 20 dBm</text>
+    <text x="32" y="179" font-size="14" fill="#52615a">80 quarter-dBm · 22:50:10 UTC</text>
+    <text x="32" y="203" font-size="14" fill="#8a3830">No IP · timeout 204</text>
+    <circle cx="310" cy="148" r="4" fill="#486b83"/>
+    <circle cx="310" cy="183" r="4" fill="#d97757"/>
+    <text x="325" y="153" font-size="15">0 receive</text>
+    <text x="325" y="188" font-size="15">0 send</text>
+    <text x="32" y="263" font-size="19" font-weight="700">Reduced ceiling: 7 dBm</text>
+    <text x="32" y="290" font-size="14" fill="#52615a">28 quarter-dBm · 22:50:40 UTC</text>
+    <text x="32" y="314" font-size="14" fill="#256345">Connected · DHCP completed</text>
+    <rect x="310" y="243" width="400" height="25" rx="3" fill="#486b83"/>
+    <rect x="310" y="278" width="400" height="25" rx="3" fill="#d97757"/>
+    <text x="722" y="261" font-size="15">2 receive</text>
+    <text x="722" y="296" font-size="15">2 send</text>
+    <text x="32" y="360" font-size="14" fill="#52615a">One run per row; an earlier reduced-ceiling run also connected.</text>
+    <text x="32" y="384" font-size="14" fill="#52615a">Configured ceilings ≠ measured RF output. Callback counts ≠ full wireless frame capture.</text>
+  </g>
+</svg>

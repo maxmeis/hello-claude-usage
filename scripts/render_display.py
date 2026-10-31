@@ -20,25 +20,35 @@ NATIVE = ROOT / "scripts" / "native"
 LVGL = ROOT / ".deps" / "sensecap-sdk" / "components" / "lvgl"
 EXE = ROOT / ".deps" / "native-ui"
 OUTPUT = ROOT / "build" / "previews"
+# The combined legacy face-refresh and forecast-preclock fixtures depended on
+# the former single-dashboard route; current face, refresh, and forecast
+# behavior is covered by the framework shell scenes below.
 SCENES = ("usage", "usage-full", "unknown", "offline", "setup", "updating", "error", "disconnected",
-          "forecast", "forecast-preclock",
-          "face-refresh", "boot", "boot-slow", "boot-interrupt", "mascot-motion",
-          "mascot-pause-setup", "mascot-pause-error", "mascot-pause-offline",
-          "mascot-pause-updating", "mascot-pause-fullface", "mascot-pause-stale",
-          "mascot-pause-tap", "footer-words", "footer-minute", "footer-error",
+          "forecast", "boot", "boot-slow", "boot-interrupt", "mascot-motion",
           "clock-normal", "clock-quarter", "clock-half", "clock-rollover",
-          "clock-unready", "clock-cycle", "clock-attention", "clock-five", "clock-midnight",
-          "settings-flow", "wifi-flow", "header-actions")
+          "clock-unready", "clock-five", "clock-midnight",
+          "settings-flow", "wifi-flow",
+          "shell-policy", "shell-ui", "shell-attention", "shell-guidance",
+          "shell-codex-weekly", "header-actions", "footer-clean")
 FACE_FRAMES = ("open", "both-closed", "wink", "done")
 BOOT_FRAMES = ("boot-open", "boot-status", "boot-done")
 CLOCK_CYCLE_FRAMES = ("clock", "face", "dashboard", "return")
 SETTINGS_FRAMES = ("pending", "qr", "unavailable", "return")
-WIFI_FRAMES = ("join", "page", "done")
-HEADER_ACTION_FRAMES = ("dashboard", "mascot-open", "mascot-wink", "manual-clock",
-                        "inflight-clock", "return-dashboard", "stale-dashboard",
-                        "stale-inflight")
+WIFI_FRAMES = ("join", "testing", "failure", "long-message", "page", "saving", "handoff")
+HEADER_ACTION_FRAMES = ("dashboard", "mascot-open", "mascot-wink", "automatic-saver")
+CONFIG_FRAMES = ("boot-open", "usage-home", "english-clock", "usage-home-after-timeout")
 FORECAST_FRAMES = ("headroom", "tight", "unknown-week", "unknown-five", "mixed", "zero", "early", "missing",
                    "stale", "error", "expired")
+SHELL_UI_FRAMES = ("home-both", "claude-app", "codex-app", "home-no-clock-shortcut",
+                   "home-refresh-complete", "home-pending-all", "home-after-claude",
+                   "home-after-codex", "mascot-face")
+SHELL_ATTENTION_FRAMES = ("saver", "fresh-home-attention", "lease-return-clock",
+                          "codex-short-only-does-not-interrupt", "codex-weekly-attention",
+                          "single-app-attention")
+SHELL_GUIDANCE_FRAMES = ("unconfigured-widget", "codex-guidance", "guidance-back",
+                         "codex-disabled-guidance")
+SHELL_CODEX_WEEKLY_FRAMES = ("home", "detail", "home-primary-week",
+                             "detail-weekly-unavailable")
 
 
 def chunk(kind: bytes, data: bytes) -> bytes:
@@ -62,10 +72,13 @@ def build(sanitize: bool) -> None:
         raise SystemExit("LVGL SDK absent; run scripts/fetch-sdk.sh first")
     sources = sorted((LVGL / "src").rglob("*.c"))
     sources += [ROOT / "main" / "display.c", ROOT / "main" / "display_format.c",
-                ROOT / "main" / "word_clock.c",
+                ROOT / "main" / "word_clock.c", ROOT / "main" / "box_config.c",
+                ROOT / "main" / "usage_provider.c", ROOT / "main" / "app_registry.c",
+                ROOT / "main" / "screensaver_registry.c", ROOT / "main" / "ui_shell.c",
+                ROOT / "main" / "usage_app_ui.c",
                 ROOT / "main" / "usage_heading_font.c", ROOT / "main" / "usage_values_font.c",
                 ROOT / "main" / "usage_ui_font.c", ROOT / "main" / "usage_status_font.c",
-                ROOT / "main" / "usage_meta_font.c",
+                ROOT / "main" / "usage_meta_font.c", ROOT / "main" / "usage_hero_font.c",
                 NATIVE / "renderer.c"]
     cmd = ["clang", "-std=gnu11", "-O1", "-DLV_CONF_INCLUDE_SIMPLE", "-DLV_LVGL_H_INCLUDE_SIMPLE",
            "-I", str(NATIVE), "-I", str(ROOT / "main"), "-I", str(LVGL),
@@ -102,12 +115,11 @@ def main() -> None:
                 ppm.unlink()
                 print(png.relative_to(ROOT))
             continue
-        if scene == "footer-words":
-            base = OUTPUT / "footer-words"
+        if scene == "footer-clean":
+            base = OUTPUT / "footer-clean"
             subprocess.run([str(EXE), scene, f"{base}.ppm"], check=True, cwd=ROOT)
-            for phase in ("start", "next"):
-                ppm = OUTPUT / f"footer-words-{phase}.ppm"
-                png = OUTPUT / f"footer-words-{phase}.png"
+            for ppm in sorted(OUTPUT.glob("footer-clean*.ppm")):
+                png = ppm.with_suffix(".png")
                 ppm_to_png(ppm, png)
                 ppm.unlink()
                 print(png.relative_to(ROOT))
@@ -153,7 +165,8 @@ def main() -> None:
                 ppm.unlink()
                 print(png.relative_to(ROOT))
             continue
-        if scene in ("clock-cycle", "settings-flow", "wifi-flow", "header-actions"):
+        if scene in ("clock-cycle", "settings-flow", "wifi-flow", "header-actions", "config-custom",
+                     "shell-ui", "shell-attention", "shell-guidance", "shell-codex-weekly"):
             base = OUTPUT / "clock-cycle"
             phases = CLOCK_CYCLE_FRAMES
             if scene == "settings-flow":
@@ -162,6 +175,16 @@ def main() -> None:
                 base, phases = OUTPUT / "wifi", WIFI_FRAMES
             elif scene == "header-actions":
                 base, phases = OUTPUT / "header-actions", HEADER_ACTION_FRAMES
+            elif scene == "config-custom":
+                base, phases = OUTPUT / "config-custom", CONFIG_FRAMES
+            elif scene == "shell-ui":
+                base, phases = OUTPUT / "shell-ui", SHELL_UI_FRAMES
+            elif scene == "shell-attention":
+                base, phases = OUTPUT / "shell-attention", SHELL_ATTENTION_FRAMES
+            elif scene == "shell-guidance":
+                base, phases = OUTPUT / "shell-guidance", SHELL_GUIDANCE_FRAMES
+            elif scene == "shell-codex-weekly":
+                base, phases = OUTPUT / "shell-codex-weekly", SHELL_CODEX_WEEKLY_FRAMES
             subprocess.run([str(EXE), scene, f"{base}.ppm"], check=True, cwd=ROOT)
             for phase in phases:
                 ppm = OUTPUT / f"{base.name}-{phase}.ppm"
@@ -169,6 +192,8 @@ def main() -> None:
                 ppm_to_png(ppm, png)
                 ppm.unlink()
                 print(png.relative_to(ROOT))
+            if scene == "config-custom":
+                (OUTPUT / f"{scene}.ppm").unlink(missing_ok=True)
             continue
         ppm = OUTPUT / f"{scene}.ppm"
         png = OUTPUT / f"{scene}.png"

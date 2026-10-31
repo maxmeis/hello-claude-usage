@@ -176,12 +176,15 @@ class DeviceIdentityTests(unittest.TestCase):
     def test_network_and_startup_use_same_identity_before_start(self):
         manager = (ROOT / "main/wifi_manager.c").read_text()
         app = (ROOT / "main/app_main.c").read_text()
+        startup = manager.split("esp_err_t wifi_manager_start(", 1)[1]
+        ap_setup = manager.split("static esp_err_t start_setup(void)", 1)[1].split(
+            "static void finish_setup(void)", 1)[0]
         self.assertRegex(manager, r"esp_netif_set_hostname\(s_manager\.sta, device_identity_name\(\)\)")
         self.assertRegex(manager, r"esp_netif_set_hostname\(s_manager\.ap, device_identity_name\(\)\)")
-        self.assertLess(manager.index("esp_netif_set_hostname(s_manager.sta"),
-                        manager.index("esp_wifi_start()"))
-        self.assertLess(manager.index("esp_netif_set_hostname(s_manager.ap"),
-                        manager.index("esp_wifi_set_mode(WIFI_MODE_APSTA)"))
+        self.assertLess(startup.index("esp_netif_set_hostname(s_manager.sta"),
+                        startup.index("esp_wifi_start()"))
+        self.assertLess(ap_setup.index("esp_netif_set_hostname(s_manager.ap"),
+                        ap_setup.index("esp_wifi_set_mode(WIFI_MODE_APSTA)"))
         self.assertRegex(manager, r"snprintf\(s_manager\.ap_ssid, sizeof\(s_manager\.ap_ssid\),\s*\"%s\", device_identity_name\(\)\)")
         self.assertIn('random_hex(s_manager.ap_password, 8)', manager)
         self.assertLess(app.index("nvs_flash_init()"), app.index("device_identity_init()"))

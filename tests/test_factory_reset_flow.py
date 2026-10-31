@@ -130,7 +130,7 @@ static int64_t s_cap_deadline = 2000, s_reset_nonce_deadline_us;
 static bool s_cap_valid = true, s_manual_session = true,
             s_settings_wanted_open = true, s_settings_committing, s_token_dirty = true;
 static atomic_bool s_reset_response_ready, s_reset_committed, s_forget_response_ready,
-                   s_reset_inflight;
+                   s_reset_inflight, s_usb_session_active;
 static const char *s_page_state = "Ready";
 static int64_t epoch = 1000, ticks = 1000000;
 static int queue_sends, queue_resets, journal_calls, stop_calls, restart_calls,

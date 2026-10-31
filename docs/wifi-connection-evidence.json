@@ -1,0 +1,210 @@
+{
+  "schema_version": 1,
+  "published_on": "2026-10-31",
+  "scope": "Selected historical observations from one SenseCAP ESP32-S3 and its tested access points. Not a statistical sample or RF measurement.",
+  "sanitization": "Allowlisted scalar outcomes only. Network identifiers, addresses, credentials, capability URLs, and raw event strings excluded. Source record names refer to private operator evidence, not published files.",
+  "units": {
+    "tx_ceiling": "Driver configured/reported maximum, quarter-dBm units; divide by 4 for dBm. Not measured radiated output.",
+    "rssi": "Received signal observations in dBm; diagnostic scan/event observation, not an uplink measurement.",
+    "wpa_callbacks": "Counts at instrumented software callback boundaries, not a full over-the-air frame capture."
+  },
+  "validation": {
+    "firmware_version": "0.14.7-wifi-tx-retry",
+    "firmware_sha256": "6cf8759d19ad0336e643ec96b750b60bfe34ed2bfda5b29b67de225466b26006",
+    "normal_helper_enabled": false,
+    "router_settings_changed": false,
+    "tests_passed": 68,
+    "targeted_sanitizer_suites_passed": 3,
+    "account_sign_in_completed": false,
+    "temporary_credential_files_removed": true,
+    "temporary_credential_build_directories_removed": 7,
+    "lan_check": {
+      "http_status": 404,
+      "http_reachable": true,
+      "ping_reachable": true,
+      "mdns_matches_verified_ip": true
+    }
+  },
+  "observations": [
+    {
+      "id": "E1",
+      "source_record": "wifi-mac-hotspot-result.json",
+      "recorded_at": "2026-10-30T22:10:49.864269+00:00",
+      "kind": "station_diagnostic",
+      "sdk": "5.1.1",
+      "access_point": "control_ap",
+      "tx_ceiling_before_quarter_dbm": null,
+      "tx_ceiling_after_quarter_dbm": null,
+      "observed_rssi_dbm": -27,
+      "wpa_rx_callback_count": 2,
+      "wpa_tx_callback_count": 2,
+      "got_ip": true,
+      "terminal_disconnect_reason": null
+    },
+    {
+      "id": "E2",
+      "source_record": "wifi-chip-lowtx-result.json",
+      "recorded_at": "2026-10-30T22:46:58.290560+00:00",
+      "kind": "station_diagnostic",
+      "sdk": "5.1.1",
+      "access_point": "target_ap",
+      "tx_ceiling_before_quarter_dbm": 80,
+      "tx_ceiling_after_quarter_dbm": 28,
+      "observed_rssi_dbm": -20,
+      "wpa_rx_callback_count": 2,
+      "wpa_tx_callback_count": 2,
+      "got_ip": true,
+      "terminal_disconnect_reason": null
+    },
+    {
+      "id": "E3",
+      "source_record": "wifi-chip-baseline-confirm-result.json",
+      "recorded_at": "2026-10-30T22:50:10.970336+00:00",
+      "kind": "station_diagnostic",
+      "sdk": "5.1.1",
+      "access_point": "target_ap",
+      "tx_ceiling_before_quarter_dbm": 80,
+      "tx_ceiling_after_quarter_dbm": 80,
+      "observed_rssi_dbm": -20,
+      "wpa_rx_callback_count": 0,
+      "wpa_tx_callback_count": 0,
+      "got_ip": false,
+      "terminal_disconnect_reason": 204
+    },
+    {
+      "id": "E4",
+      "source_record": "wifi-chip-lowtx-confirm-result.json",
+      "recorded_at": "2026-10-30T22:50:40.517577+00:00",
+      "kind": "station_diagnostic",
+      "sdk": "5.1.1",
+      "access_point": "target_ap",
+      "tx_ceiling_before_quarter_dbm": 80,
+      "tx_ceiling_after_quarter_dbm": 28,
+      "observed_rssi_dbm": -20,
+      "wpa_rx_callback_count": 2,
+      "wpa_tx_callback_count": 2,
+      "got_ip": true,
+      "terminal_disconnect_reason": null
+    },
+    {
+      "id": "E5",
+      "source_record": "adaptive-tx-first-result.json",
+      "recorded_at": "2026-10-30T23:15:24.418256+00:00",
+      "kind": "normal_firmware_boot",
+      "got_ip": true,
+      "fallback_used": true,
+      "tx_limit_after_ip": 28,
+      "sntp_ready": true,
+      "account_setup_ready": true,
+      "usage_ok": false,
+      "disconnects_after_ip": 0,
+      "stable_for_20_seconds": true
+    },
+    {
+      "id": "E6",
+      "source_record": "adaptive-tx-reboot-result.json",
+      "recorded_at": "2026-10-30T23:15:52.720577+00:00",
+      "kind": "normal_firmware_boot",
+      "got_ip": true,
+      "fallback_used": true,
+      "tx_limit_after_ip": 28,
+      "sntp_ready": true,
+      "account_setup_ready": true,
+      "usage_ok": false,
+      "disconnects_after_ip": 0,
+      "stable_for_20_seconds": true
+    }
+  ],
+  "other_diagnostic_observations": [
+    {
+      "id": "C1",
+      "experiment": "Confirmed passphrase, minimal station",
+      "source_record": "wifi-direct-confirmed-result.json",
+      "recorded_at": "2026-10-30T18:29:29.553044+00:00",
+      "got_ip": false,
+      "reason": 204,
+      "rssi": -24
+    },
+    {
+      "id": "C2",
+      "experiment": "Pre-derived PSK",
+      "source_record": "wifi-direct-rawpsk-result.json",
+      "recorded_at": "2026-10-30T18:34:43.508059+00:00",
+      "got_ip": false,
+      "reason": 204,
+      "rssi": -24
+    },
+    {
+      "id": "C3",
+      "experiment": "Power saving disabled",
+      "source_record": "wifi-direct-psnone-result.json",
+      "recorded_at": "2026-10-30T18:43:38.958802+00:00",
+      "got_ip": false,
+      "reason": 204,
+      "rssi": -24
+    },
+    {
+      "id": "C4",
+      "experiment": "802.11b/g protocols",
+      "source_record": "wifi-direct-legacy-confirmed-result.json",
+      "recorded_at": "2026-10-30T18:40:21.971866+00:00",
+      "got_ip": false,
+      "reason": 204,
+      "rssi": -24
+    },
+    {
+      "id": "C5",
+      "experiment": "Wi-Fi NVS initialization control",
+      "source_record": "wifi-direct-nvs-result.json",
+      "recorded_at": "2026-10-30T18:51:06.119715+00:00",
+      "got_ip": false,
+      "reason": 204,
+      "rssi": -24
+    },
+    {
+      "id": "C6",
+      "experiment": "ESP-IDF 5.1.6",
+      "source_record": "wifi-direct-idf516-result.json",
+      "recorded_at": "2026-10-30T18:56:23.965833+00:00",
+      "got_ip": false,
+      "reason": 204,
+      "rssi": -20
+    },
+    {
+      "id": "C7",
+      "experiment": "Alternate station MAC",
+      "source_record": "wifi-direct-local-mac-result.json",
+      "recorded_at": "2026-10-30T19:19:27.394823+00:00",
+      "got_ip": false,
+      "reason": 204,
+      "rssi": -24
+    },
+    {
+      "id": "C8",
+      "experiment": "Explicit PMF disable",
+      "source_record": "wifi-chip-pmfoff-result.json",
+      "recorded_at": "2026-10-30T22:38:10.786734+00:00",
+      "got_ip": false,
+      "reason": 204,
+      "rssi": -20
+    },
+    {
+      "id": "C9",
+      "experiment": "No explicit preliminary scan",
+      "source_record": "wifi-chip-noscan-result.json",
+      "recorded_at": "2026-10-30T22:38:40.064639+00:00",
+      "got_ip": false,
+      "reason": 39,
+      "rssi": -20
+    },
+    {
+      "id": "C10",
+      "experiment": "ESP-IDF 5.1.7",
+      "source_record": "wifi-chip-idf517-result.json",
+      "recorded_at": "2026-10-30T22:42:28.075026+00:00",
+      "got_ip": false,
+      "reason": 2,
+      "rssi": -18
+    }
+  ]
+}

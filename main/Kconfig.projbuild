@@ -1,4 +1,12 @@
 menu "OAuth probe"
+    config HELLO_BOX_USB_TEST_HELPER
+        bool "Temporary USB setup test helper (development only)"
+        default n
+        help
+            Enables an explicit USB console command to read the temporary
+            setup AP and page details for local hardware tests. Keep disabled
+            in normal firmware and restore normal firmware after testing.
+
     config OAUTH_PROBE_HTTP_PORT
         int "Local settings and Wi-Fi setup HTTP port"
         range 1024 65535

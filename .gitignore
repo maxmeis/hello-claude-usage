@@ -1,5 +1,6 @@
 .deps/
 .private/
+.vercel/
 build*/
 sdkconfig
 sdkconfig.old
@@ -7,6 +8,9 @@ main/provision.h
 __pycache__/
 *.py[cod]
 *.bin
+!web-installer/public/firmware/bootloader.bin
+!web-installer/public/firmware/partitions.bin
+!web-installer/public/firmware/hello-box.bin
 *.elf
 *.map
 *.log

@@ -57,6 +57,8 @@ static char s_reset_nonce[48];
 static uint32_t s_reset_nonce_session;
 static int64_t s_reset_nonce_deadline_us;
 static atomic_bool s_forget_response_ready;
+/* USB OAuth status is a separate session and blocks the phone Settings QR. */
+static atomic_bool s_usb_session_active, s_usage_validated;
 static settings_command_t queued_settings;
 static bool settings_queued, forget_queued, wifi_connected = true, clock_ready = true;
 static uint32_t queued_forget, displayed_closed_id;
@@ -69,6 +71,13 @@ static token_store_t *token = &current_token, *candidate = &incoming_token;
 static bool s_token_dirty, first_usage, allow_save = true;
 static int64_t next_usage = 99, usage_retry_until = 429, next_refresh = 88;
 static int failures = 3;
+static int reset_usage_calls;
+static bool reset_usage_configured;
+static char reset_usage_status[72];
+static void reset_claude_usage(bool configured, const char *status) {
+    ++reset_usage_calls; reset_usage_configured = configured;
+    snprintf(reset_usage_status, sizeof(reset_usage_status), "%s", status ? status : "");
+}
 static bool save_token(token_store_t *value) {
     assert(value == &incoming_token); return allow_save;
 }
@@ -133,6 +142,8 @@ int main(void) {
     assert(!s_settings_committing && current_token.identity == 2);
     assert(usage_retry_until == 0 && next_usage == 0 && next_refresh == 0);
     assert(first_usage && failures == 0 && !s_token_dirty);
+    assert(reset_usage_calls == 1 && reset_usage_configured &&
+           !strcmp(reset_usage_status, "Checking new account"));
     assert(request_settings(NULL, 11, false));
     process_settings(true, state, verifier);
 
@@ -145,6 +156,7 @@ int main(void) {
     commit_candidate();
     assert(current_token.identity == 1 && usage_retry_until == 429);
     assert(next_usage == 99 && next_refresh == 88 && !first_usage && failures == 3);
+    assert(reset_usage_calls == 1); /* Failed save leaves old-account usage intact. */
     assert(request_settings(NULL, 13, false));
     process_settings(true, state, verifier);
     allow_save = true;

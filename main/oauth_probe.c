@@ -9,6 +9,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <netdb.h>
 
 #include "cJSON.h"
 #include "esp_crt_bundle.h"
@@ -28,12 +29,18 @@
 #include "sdkconfig.h"
 
 #include "display.h"
+#include "app_registry.h"
+#include "box_config.h"
 #include "device_discovery.h"
 #include "device_identity.h"
 #include "factory_reset.h"
+#include "codex_adapter.h"
+#include "display_format.h"
+#include "provider_http.h"
 #include "probe_protocol.h"
 #include "refresh_control.h"
 #include "wifi_manager.h"
+#include "wifi_store.h"
 
 #define CLIENT_ID "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 #define REDIRECT_URI "https://platform.claude.com/oauth/code/callback"
@@ -67,6 +74,10 @@ typedef struct {
 typedef struct { char code[513]; uint32_t session; } submission_t;
 typedef struct { uint32_t request_id; bool open; } settings_command_t;
 typedef struct { uint32_t session, request_id; char cap[48]; int64_t deadline_us; } reset_command_t;
+typedef struct {
+    uint32_t id;
+    char method[24], arg1[64], arg2[513];
+} management_command_t;
 
 static EventGroupHandle_t s_wifi_events;
 static esp_netif_t *s_sta;
@@ -74,6 +85,7 @@ static QueueHandle_t s_submissions;
 static QueueHandle_t s_settings_commands;
 static QueueHandle_t s_forget_commands;
 static QueueHandle_t s_reset_commands;
+static QueueHandle_t s_management_commands;
 static SemaphoreHandle_t s_cap_lock;
 static httpd_handle_t s_server;
 static char s_cap[48];
@@ -104,12 +116,202 @@ static atomic_bool s_time_synced;
 static portMUX_TYPE s_refresh_mux = portMUX_INITIALIZER_UNLOCKED;
 static refresh_control_t s_refresh_control;
 static TaskHandle_t s_worker_task;
+static portMUX_TYPE s_management_mux = portMUX_INITIALIZER_UNLOCKED;
+static oauth_management_status_t s_management;
+static provider_usage_t s_claude_usage;
+static uint32_t s_management_codex_id; /* OAuth worker only. */
+static atomic_bool s_usb_session_active;
+static atomic_bool s_token_configured;
+static atomic_bool s_usage_validated;
+static uint32_t s_management_wifi_id; /* OAuth worker only. */
+static uint32_t s_claude_cycle_generation; /* OAuth worker owns its cycle. */
+static struct {
+    char state[48], verifier[80];
+    int64_t deadline_us;
+} s_usb_oauth;
 
 static int64_t now_s(void) { return (int64_t)time(NULL); }
 static bool wifi_up(void) { return (xEventGroupGetBits(s_wifi_events) & OAUTH_WIFI_CONNECTED) != 0; }
 
 static void on_time_sync(struct timeval *tv) { (void)tv; atomic_store(&s_time_synced, true); }
 static bool clock_valid(void) { return atomic_load(&s_time_synced) && now_s() > 1735689600; }
+
+static void management_operation(uint32_t id, const char *method,
+                                 const char *state, const char *message)
+{
+    taskENTER_CRITICAL(&s_management_mux);
+    s_management.operation.id = id;
+    snprintf(s_management.operation.method, sizeof(s_management.operation.method), "%s", method);
+    snprintf(s_management.operation.state, sizeof(s_management.operation.state), "%s", state);
+    snprintf(s_management.operation.message, sizeof(s_management.operation.message), "%s", message);
+    taskEXIT_CRITICAL(&s_management_mux);
+}
+
+static void management_account(bool configured, const char *state,
+                               const char *session, const char *url)
+{
+    taskENTER_CRITICAL(&s_management_mux);
+    s_management.configured = configured;
+    snprintf(s_management.state, sizeof(s_management.state), "%s", state);
+    snprintf(s_management.session, sizeof(s_management.session), "%s", session ? session : "");
+    snprintf(s_management.authorization_url, sizeof(s_management.authorization_url),
+             "%s", url ? url : "");
+    taskEXIT_CRITICAL(&s_management_mux);
+}
+
+static void management_network_invalidate(const char *message)
+{
+    taskENTER_CRITICAL(&s_management_mux);
+    s_management.network.dns = false;
+    s_management.network.https = false;
+    snprintf(s_management.network.state, sizeof(s_management.network.state), "untested");
+    snprintf(s_management.network.message, sizeof(s_management.network.message),
+             "%s", message);
+    taskEXIT_CRITICAL(&s_management_mux);
+}
+
+void oauth_probe_get_management_status(oauth_management_status_t *out)
+{
+    if (!out) return;
+    taskENTER_CRITICAL(&s_management_mux);
+    *out = s_management;
+    out->usage = s_claude_usage;
+    taskEXIT_CRITICAL(&s_management_mux);
+    out->configured = atomic_load(&s_token_configured);
+    out->usage.configured = out->configured;
+    if (!atomic_load(&s_usb_session_active))
+        snprintf(out->state, sizeof(out->state), "%s",
+                 !out->configured ? "not_configured" :
+                 atomic_load(&s_usage_validated) ? "validated" : "checking");
+    bool connected = s_wifi_events && wifi_up() && !wifi_manager_is_provisioning();
+    bool just_reconnected = s_wifi_events &&
+                            (xEventGroupGetBits(s_wifi_events) & OAUTH_WIFI_RECONNECTED);
+    esp_netif_ip_info_t ip = {0};
+    bool has_ip = connected && s_sta &&
+                  esp_netif_get_ip_info(s_sta, &ip) == ESP_OK && ip.ip.addr != 0;
+    out->network.wifi = connected;
+    out->network.ip = has_ip;
+    out->network.clock = clock_valid();
+    if (!connected || !has_ip || !out->network.clock || just_reconnected) {
+        out->network.dns = false;
+        out->network.https = false;
+    }
+    if (!connected) {
+        snprintf(out->network.state, sizeof(out->network.state), "offline");
+        snprintf(out->network.message, sizeof(out->network.message), "Wi-Fi is offline");
+    } else if (!has_ip) {
+        snprintf(out->network.state, sizeof(out->network.state), "waiting_ip");
+        snprintf(out->network.message, sizeof(out->network.message), "Waiting for an IP address");
+    } else if (!out->network.clock) {
+        snprintf(out->network.state, sizeof(out->network.state), "waiting_time");
+        snprintf(out->network.message, sizeof(out->network.message), "Waiting for a valid clock");
+    } else if (just_reconnected) {
+        snprintf(out->network.state, sizeof(out->network.state), "untested");
+        snprintf(out->network.message, sizeof(out->network.message),
+                 "Network changed; run test again");
+    } else if (!out->network.state[0]) {
+        snprintf(out->network.state, sizeof(out->network.state), "untested");
+        snprintf(out->network.message, sizeof(out->network.message), "Run network test");
+    }
+}
+
+static bool claude_selected(void)
+{
+    return usage_provider_enabled(box_config_current()->providers, USAGE_PROVIDER_CLAUDE);
+}
+
+static bool codex_selected(void)
+{
+    return usage_provider_enabled(box_config_current()->providers, USAGE_PROVIDER_CODEX);
+}
+
+static void publish_claude_usage(const provider_usage_t *usage)
+{
+    taskENTER_CRITICAL(&s_management_mux);
+    s_claude_usage = *usage;
+    taskEXIT_CRITICAL(&s_management_mux);
+    display_provider_update(USAGE_PROVIDER_CLAUDE, usage);
+}
+
+static void reset_claude_usage(bool configured, const char *status)
+{
+    provider_usage_t snapshot = {.configured = configured};
+    if (status) snprintf(snapshot.status, sizeof(snapshot.status), "%s", status);
+    publish_claude_usage(&snapshot);
+}
+
+static void claude_status(const char *title, const char *detail)
+{
+    taskENTER_CRITICAL(&s_management_mux);
+    s_claude_usage.configured = atomic_load(&s_token_configured);
+    snprintf(s_claude_usage.status, sizeof(s_claude_usage.status), "%s", detail);
+    s_claude_usage.updating = false;
+    provider_usage_t snapshot = s_claude_usage;
+    taskEXIT_CRITICAL(&s_management_mux);
+    display_provider_update(USAGE_PROVIDER_CLAUDE, &snapshot);
+    if (claude_selected() && !codex_selected()) display_status(title, detail);
+}
+
+static void claude_updating(void)
+{
+    taskENTER_CRITICAL(&s_management_mux);
+    s_claude_usage.configured = true;
+    s_claude_usage.updating = true;
+    snprintf(s_claude_usage.status, sizeof(s_claude_usage.status), "Checking usage");
+    provider_usage_t snapshot = s_claude_usage;
+    taskEXIT_CRITICAL(&s_management_mux);
+    display_provider_update(USAGE_PROVIDER_CLAUDE, &snapshot);
+    if (!codex_selected()) display_updating();
+}
+
+bool oauth_probe_management_request(uint32_t id, const char *method,
+                                    const char *arg1, const char *arg2)
+{
+    if (!id || !method || !s_management_commands || !s_worker_task ||
+        atomic_load(&s_reset_committed)) return false;
+    management_command_t cmd = {.id = id};
+    size_t method_len = strnlen(method, sizeof(cmd.method));
+    size_t arg1_len = arg1 ? strnlen(arg1, sizeof(cmd.arg1)) : 0;
+    size_t arg2_len = arg2 ? strnlen(arg2, sizeof(cmd.arg2)) : 0;
+    if (method_len == sizeof(cmd.method) || arg1_len == sizeof(cmd.arg1) ||
+        arg2_len == sizeof(cmd.arg2)) return false;
+    if (strcmp(method, "wifi.connect") && strcmp(method, "network.test") &&
+        strcmp(method, "codex.begin") && strcmp(method, "codex.cancel") &&
+        strcmp(method, "claude.begin") && strcmp(method, "claude.submit_code") &&
+        strcmp(method, "claude.cancel")) return false;
+    if (!strcmp(method, "wifi.connect") &&
+        (!arg1 || !arg2 || !wifi_store_valid_credentials(arg1, arg2))) return false;
+    if (!strcmp(method, "claude.submit_code") && (!arg1_len || !arg2_len)) return false;
+    memcpy(cmd.method, method, method_len + 1);
+    if (arg1) memcpy(cmd.arg1, arg1, arg1_len + 1);
+    if (arg2) memcpy(cmd.arg2, arg2, arg2_len + 1);
+    taskENTER_CRITICAL(&s_management_mux);
+    bool duplicate = s_management.operation.id == id &&
+                     strcmp(s_management.operation.method, method) == 0;
+    bool reused_id = s_management.operation.id == id && !duplicate;
+    bool busy = !strcmp(s_management.operation.state, "queued") ||
+                !strcmp(s_management.operation.state, "running");
+    if (!duplicate && !reused_id && !busy) {
+        s_management.operation.id = id;
+        snprintf(s_management.operation.method, sizeof(s_management.operation.method), "%s", method);
+        snprintf(s_management.operation.state, sizeof(s_management.operation.state), "queued");
+        snprintf(s_management.operation.message, sizeof(s_management.operation.message),
+                 "Waiting for device worker");
+    }
+    taskEXIT_CRITICAL(&s_management_mux);
+    if (duplicate || reused_id || busy) {
+        memset(&cmd, 0, sizeof(cmd));
+        return duplicate;
+    }
+    if (xQueueSend(s_management_commands, &cmd, 0) != pdTRUE) {
+        management_operation(id, method, "failed", "Device queue is busy");
+        memset(&cmd, 0, sizeof(cmd));
+        return false;
+    }
+    memset(&cmd, 0, sizeof(cmd));
+    xTaskNotifyGive(s_worker_task);
+    return true;
+}
 
 static void publish_refresh(bool ready, int64_t retry_at)
 {
@@ -118,7 +320,7 @@ static void publish_refresh(bool ready, int64_t retry_at)
     taskEXIT_CRITICAL(&s_refresh_mux);
 }
 
-static bool begin_refresh(bool automatic_due, bool *manual)
+static bool begin_refresh(bool automatic_due, bool *manual, uint32_t *generation)
 {
     taskENTER_CRITICAL(&s_refresh_mux);
     bool began = (automatic_due || s_refresh_control.pending) &&
@@ -126,34 +328,50 @@ static bool begin_refresh(bool automatic_due, bool *manual)
     taskEXIT_CRITICAL(&s_refresh_mux);
     if (began) {
         if (*manual) ESP_LOGI(TAG, "Manual usage refresh started");
-        display_refresh_cycle_begin();
-        display_updating();
+        if (++s_claude_cycle_generation == 0) ++s_claude_cycle_generation;
+        *generation = s_claude_cycle_generation;
+        display_app_refresh_begin(APP_ID_CLAUDE, *generation);
+        claude_updating();
     }
     return began;
 }
 
-static void end_refresh(bool ready, int64_t retry_at)
+static void end_refresh(bool ready, int64_t retry_at, uint32_t generation)
 {
-    display_refresh_cycle_end();
+    display_app_refresh_end(APP_ID_CLAUDE, generation);
     taskENTER_CRITICAL(&s_refresh_mux);
     refresh_control_finish(&s_refresh_control, ready, retry_at);
     taskEXIT_CRITICAL(&s_refresh_mux);
 }
 
-static bool request_manual_refresh(void *context)
+static uint32_t request_app_refresh(void *context, app_id_t app_id)
 {
     (void)context;
+    if (app_id != APP_ID_ALL && app_id != APP_ID_CLAUDE && app_id != APP_ID_CODEX)
+        return 0;
     if (!s_worker_task || !s_wifi_events || atomic_load(&s_reset_committed) ||
-        !wifi_up() || !clock_valid()) return false;
+        !wifi_up() || !clock_valid()) return 0;
     int64_t now = now_s();
+    bool claude = (app_id == APP_ID_ALL || app_id == APP_ID_CLAUDE) && claude_selected();
+    bool codex = (app_id == APP_ID_ALL || app_id == APP_ID_CODEX) && codex_selected();
+    codex_management_status_t codex_status = {0};
+    if (codex) codex_adapter_get_status(&codex_status);
     taskENTER_CRITICAL(&s_refresh_mux);
-    bool accepted = refresh_control_request(&s_refresh_control, now);
+    bool claude_accepted = claude && refresh_control_request(&s_refresh_control, now);
     taskEXIT_CRITICAL(&s_refresh_mux);
-    if (accepted) {
+    bool codex_accepted = codex && codex_status.configured && codex_adapter_refresh();
+    uint32_t accepted = (claude_accepted ? 1u << APP_ID_CLAUDE : 0u) |
+                        (codex_accepted ? 1u << APP_ID_CODEX : 0u);
+    if (accepted != 0) {
         ESP_LOGI(TAG, "Manual usage refresh accepted");
         xTaskNotifyGive(s_worker_task);
     }
     return accepted;
+}
+
+static bool request_manual_refresh(void *context)
+{
+    return request_app_refresh(context, APP_ID_ALL) != 0;
 }
 
 static bool settings_wanted(uint32_t id)
@@ -187,6 +405,7 @@ static bool request_settings(void *context, uint32_t request_id, bool open)
 {
     (void)context;
     if (!s_settings_commands || !s_worker_task || !request_id) return false;
+    if (open && atomic_load(&s_usb_session_active)) return false;
     settings_command_t command = {.request_id = request_id, .open = open};
     taskENTER_CRITICAL(&s_settings_mux);
     if (s_settings_committing) {
@@ -239,6 +458,17 @@ static bool pkce_challenge(const char *verifier, char *challenge, size_t capacit
     return true;
 }
 
+static bool authorization_url(char *url, size_t capacity,
+                              const char *challenge, const char *state)
+{
+    int n = snprintf(url, capacity,
+        AUTH_URL "?code=true&client_id=" CLIENT_ID "&response_type=code&redirect_uri="
+        "https%%3A%%2F%%2Fplatform.claude.com%%2Foauth%%2Fcode%%2Fcallback"
+        "&scope=user%%3Aprofile%%20user%%3Ainference&code_challenge=%s&code_challenge_method=S256&state=%s",
+        challenge, state);
+    return n > 0 && (size_t)n < capacity;
+}
+
 static bool token_valid(const token_store_t *t)
 {
     return t->version == TOKEN_VERSION && t->expires_at > 0 &&
@@ -253,7 +483,9 @@ static bool load_token(token_store_t *t)
     if (nvs_open("claude_probe", NVS_READONLY, &h) != ESP_OK) return false;
     esp_err_t err = nvs_get_blob(h, "token", t, &size);
     nvs_close(h);
-    return err == ESP_OK && size == sizeof(*t) && token_valid(t);
+    bool valid = err == ESP_OK && size == sizeof(*t) && token_valid(t);
+    atomic_store(&s_token_configured, valid);
+    return valid;
 }
 
 static bool save_token(const token_store_t *t)
@@ -263,6 +495,7 @@ static bool save_token(const token_store_t *t)
     esp_err_t err = nvs_set_blob(h, "token", t, sizeof(*t));
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
+    if (err == ESP_OK) atomic_store(&s_token_configured, true);
     return err == ESP_OK;
 }
 
@@ -273,6 +506,10 @@ static bool clear_token(void)
     esp_err_t err = nvs_erase_key(h, "token");
     if (err == ESP_OK || err == ESP_ERR_NVS_NOT_FOUND) err = nvs_commit(h);
     nvs_close(h);
+    if (err == ESP_OK) {
+        atomic_store(&s_token_configured, false);
+        atomic_store(&s_usage_validated, false);
+    }
     return err == ESP_OK;
 }
 
@@ -298,13 +535,14 @@ static int request_json(const char *url, const char *post_body, const char *bear
 {
     memset(r, 0, sizeof(*r));
     if (wifi_manager_is_provisioning()) return -1;
+    if (!provider_http_take(pdMS_TO_TICKS(20000))) return -1;
     esp_http_client_config_t config = {
         .url = url, .method = post_body ? HTTP_METHOD_POST : HTTP_METHOD_GET,
         .timeout_ms = 15000, .crt_bundle_attach = esp_crt_bundle_attach,
         .event_handler = http_event, .user_data = r, .disable_auto_redirect = true,
     };
     esp_http_client_handle_t c = esp_http_client_init(&config);
-    if (!c) return -1;
+    if (!c) { provider_http_give(); return -1; }
     esp_http_client_set_header(c, "Accept", "application/json");
     esp_http_client_set_header(c, "anthropic-beta", OAUTH_BETA);
     esp_http_client_set_header(c, "anthropic-version", "2023-06-01");
@@ -316,6 +554,7 @@ static int request_json(const char *url, const char *post_body, const char *bear
     if (bearer) {
         if (snprintf(authorization, sizeof(authorization), "Bearer %s", bearer) >= sizeof(authorization)) {
             esp_http_client_cleanup(c);
+            provider_http_give();
             return -1;
         }
         esp_http_client_set_header(c, "Authorization", authorization);
@@ -327,6 +566,7 @@ static int request_json(const char *url, const char *post_body, const char *bear
              (long long)((esp_timer_get_time() - began) / 1000), (unsigned long)esp_get_free_heap_size());
     memset(authorization, 0, sizeof(authorization));
     esp_http_client_cleanup(c);
+    provider_http_give();
     return status;
 }
 
@@ -410,7 +650,8 @@ static refresh_result_t refresh(token_store_t *t, int *retry_after)
     } else if (status == 400 && invalid_grant(r)) {
         if (clear_token()) {
             ESP_LOGW(TAG, "OAuth refresh invalid_grant; account setup required");
-            display_status("OAuth error", "Sign in again");
+            reset_claude_usage(false, "Sign in again");
+            claude_status("OAuth error", "Sign in again");
             result = REFRESH_RECONNECT;
         } else {
             ESP_LOGE(TAG, "Could not clear invalid OAuth credential");
@@ -471,7 +712,23 @@ static int poll_usage(token_store_t *t, int *retry_after)
             float five = utilization(root, "five_hour", five_reset, sizeof(five_reset));
             float week = utilization(root, "seven_day", week_reset, sizeof(week_reset));
             if (wifi_up() && !wifi_manager_is_provisioning()) {
-                display_usage(five, five_reset, week, week_reset);
+                provider_usage_t usage = {0};
+                usage.configured = true;
+                usage.has_sample = true;
+                usage.sampled_at = now_s();
+                usage.sampled_us = esp_timer_get_time();
+                float used[2] = {five, week};
+                const char *resets[2] = {five_reset, week_reset};
+                const uint32_t durations[2] = {18000, 604800};
+                for (unsigned i = 0; i < 2; ++i) {
+                    quota_window_t *window = &usage.windows[i];
+                    window->valid = isfinite(used[i]) && used[i] >= 0 && used[i] <= 100;
+                    window->used_percent = used[i];
+                    window->window_seconds = durations[i];
+                    if (!display_parse_reset(resets[i], &window->resets_at))
+                        window->resets_at = 0;
+                }
+                publish_claude_usage(&usage);
                 ESP_LOGI(TAG, "Usage response accepted: five=%s week=%s", five < 0 ? "unknown" : "known",
                          week < 0 ? "unknown" : "known");
             } else status = -1;
@@ -568,8 +825,8 @@ static esp_err_t setup_get(httpd_req_t *req)
         "</style></head><body><main><header><p class='device-name'>%s</p><h1>Settings</h1></header>"
         "<section aria-labelledby='account-title'><h2 id='account-title'>Claude account</h2>"
         "<p>Sign in with a code to connect or change the Claude account on this device.</p>"
-        "<ol><li><span class='step-title'>Get a sign-in code</span>Open Claude sign-in, sign in, then copy the code shown there."
-        "<p><a href='%s' rel='noreferrer noopener'>Open Claude sign-in</a></p></li>"
+        "<ol><li><span class='step-title'>Get a sign-in code</span>Open Claude sign-in in a new tab, sign in, then return here with the code."
+        "<p><a href='%s' target='_blank' rel='noreferrer noopener'>Open Claude sign-in</a></p></li>"
         "<li><span class='step-title'>Enter the code here</span><span id='code-help'>Paste the full code, including #state.</span>"
         "<label for='code'>Sign-in code</label><textarea id='code' autocomplete='off' spellcheck='false' aria-describedby='code-help'></textarea>"
         "<button id='send' class='primary' type='button'>Save Claude sign-in</button></li></ol>"
@@ -798,6 +1055,13 @@ static void stop_setup(void)
     if (manual) display_settings_closed(request_id);
 }
 
+static void show_auto_setup(const char *url)
+{
+    /* An unconfigured Claude account must not cover a working Codex Home. */
+    s_auto_qr_visible = claude_selected() && !codex_selected();
+    if (s_auto_qr_visible) display_setup(url);
+}
+
 static bool start_setup(char *state, char *verifier, bool manual, uint32_t request_id)
 {
     if (wifi_manager_is_provisioning()) return false;
@@ -860,8 +1124,7 @@ static bool start_setup(char *state, char *verifier, bool manual, uint32_t reque
         display_settings_qr(request_id, url);
         s_auto_qr_visible = false;
     } else {
-        display_setup(url);
-        s_auto_qr_visible = true;
+        show_auto_setup(url);
     }
     (void)device_discovery_update_url(s_setup_url, sizeof(s_setup_url), url);
     ESP_LOGI(TAG, "Account setup available for 600 seconds");
@@ -919,7 +1182,8 @@ static void process_settings(bool have_token, char *state, char *verifier)
     }
     if (!settings_wanted(command.request_id)) return;
     if (s_manual_session) stop_setup();
-    if (!have_token || !wifi_up() || !clock_valid() || wifi_manager_is_provisioning()) {
+    if (!have_token || !wifi_up() || !clock_valid() ||
+        wifi_manager_is_provisioning() || atomic_load(&s_usb_session_active)) {
         display_settings_closed(command.request_id);
         return;
     }
@@ -990,22 +1254,263 @@ static void process_factory_reset(token_store_t *token, char *state, char *verif
     for (;;) vTaskDelay(portMAX_DELAY);
 }
 
+static void usb_oauth_clear(bool configured)
+{
+    atomic_store(&s_usb_session_active, false);
+    memset(&s_usb_oauth, 0, sizeof(s_usb_oauth));
+    management_account(configured, configured ? "configured" : "not_configured", "", "");
+}
+
+static void management_network_test(void)
+{
+    bool connected = wifi_up() && !wifi_manager_is_provisioning();
+    bool clock = clock_valid();
+    bool has_ip = false, dns = false, https = false;
+    esp_netif_ip_info_t ip = {0};
+    has_ip = connected && s_sta && esp_netif_get_ip_info(s_sta, &ip) == ESP_OK && ip.ip.addr;
+    const char *message = !connected ? "Wi-Fi is offline" :
+                          !has_ip ? "Waiting for an IP address" :
+                          !clock ? "Waiting for a valid clock" : "Network test failed";
+    if (connected && has_ip && clock) {
+        struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+        struct addrinfo *result = NULL;
+        dns = getaddrinfo("api.anthropic.com", "443", &hints, &result) == 0 && result;
+        if (result) freeaddrinfo(result);
+        if (dns) {
+            response_t *response = calloc(1, sizeof(*response));
+            if (response) {
+                /* A non-2xx HTTP response still proves DNS and certificate-
+                 * verified TLS to the fixed endpoint, without any token. */
+                int status = request_json("https://api.anthropic.com/", NULL, NULL, response);
+                https = status >= 100 && status <= 599;
+                memset(response, 0, sizeof(*response));
+                free(response);
+            }
+        }
+        message = !dns ? "DNS lookup failed" :
+                  !https ? "Verified HTTPS failed" : "DNS and verified HTTPS reachable";
+    }
+    if (!wifi_up() || wifi_manager_is_provisioning()) {
+        connected = false;
+        has_ip = false;
+        dns = false;
+        https = false;
+        message = "Wi-Fi disconnected during test";
+    }
+    taskENTER_CRITICAL(&s_management_mux);
+    s_management.network.wifi = connected;
+    s_management.network.ip = has_ip;
+    s_management.network.clock = clock;
+    s_management.network.dns = dns;
+    s_management.network.https = https;
+    snprintf(s_management.network.state, sizeof(s_management.network.state),
+             "%s", https ? "online" : "failed");
+    snprintf(s_management.network.message, sizeof(s_management.network.message), "%s", message);
+    taskEXIT_CRITICAL(&s_management_mux);
+}
+
+static void management_poll_wifi(void)
+{
+    if (!s_management_wifi_id) return;
+    wifi_manager_status_t wifi;
+    wifi_manager_get_status(&wifi);
+    if (wifi.operation_id == s_management_wifi_id &&
+        ((!strcmp(wifi.state, "connected") && !wifi.provisioning) ||
+         !strcmp(wifi.state, "failed"))) {
+        management_operation(s_management_wifi_id, "wifi.connect",
+                             !strcmp(wifi.state, "connected") ? "done" : "failed",
+                             wifi.message[0] ? wifi.message :
+                             !strcmp(wifi.state, "connected") ? "Wi-Fi connected and saved" :
+                             "Wi-Fi connection failed");
+        s_management_wifi_id = 0;
+    }
+}
+
+static void management_poll_codex(void)
+{
+    codex_management_status_t codex = {0};
+    codex_adapter_get_status(&codex);
+    if (!s_management_codex_id) {
+        /* Issuing the code completes the begin request, but authorization can
+         * fail later. Report that failure while this is still the latest USB
+         * operation, without replacing a newer request's result. */
+        taskENTER_CRITICAL(&s_management_mux);
+        bool latest_begin = codex.operation.id &&
+            codex.operation.id == s_management.operation.id &&
+            !strcmp(s_management.operation.method, "codex.begin") &&
+            !strcmp(s_management.operation.state, "done") &&
+            !strcmp(codex.operation.method, "codex.begin") &&
+            !strcmp(codex.operation.state, "error");
+        taskEXIT_CRITICAL(&s_management_mux);
+        if (latest_begin)
+            management_operation(codex.operation.id, "codex.begin", "failed",
+                                 codex.operation.message);
+        return;
+    }
+    if (codex.operation.id != s_management_codex_id ||
+        (!strcmp(codex.operation.state, "accepted") ||
+         !strcmp(codex.operation.state, "queued") ||
+         !strcmp(codex.operation.state, "running"))) return;
+    management_operation(s_management_codex_id, codex.operation.method,
+                         !strcmp(codex.operation.state, "error") ? "failed" :
+                         codex.operation.state, codex.operation.message);
+    s_management_codex_id = 0;
+}
+
+static void process_management(token_store_t *token, bool *have_token,
+                               char *state, char *verifier,
+                               int64_t *next_usage, int64_t *next_refresh,
+                               int64_t *usage_retry_until, int *failures,
+                               bool *first_usage)
+{
+    management_command_t cmd = {0};
+    if (!s_management_commands || xQueueReceive(s_management_commands, &cmd, 0) != pdTRUE) return;
+    management_operation(cmd.id, cmd.method, "running", "Processing on device");
+    bool done = false;
+    const char *message = "Request failed";
+    if (!strcmp(cmd.method, "wifi.connect")) {
+        codex_management_status_t codex = {0};
+        codex_adapter_get_status(&codex);
+        if (s_manual_session || atomic_load(&s_usb_session_active) ||
+            !strcmp(codex.state, "starting") || !strcmp(codex.state, "awaiting_code") ||
+            !strcmp(codex.state, "verifying")) {
+            message = "Close active account setup first";
+        } else {
+            if (s_server) {
+                stop_setup();
+                memset(state, 0, 48);
+                memset(verifier, 0, 80);
+            }
+            done = wifi_manager_request_connect(cmd.id, cmd.arg1, cmd.arg2);
+            if (done) {
+                management_network_invalidate("Wi-Fi connection is changing");
+                s_management_wifi_id = cmd.id;
+                management_operation(cmd.id, cmd.method, "running",
+                                     "Wi-Fi connection test in progress");
+                memset(&cmd, 0, sizeof(cmd));
+                return;
+            }
+            message = "Wi-Fi connection test unavailable";
+        }
+    } else if (!strcmp(cmd.method, "codex.begin") ||
+               !strcmp(cmd.method, "codex.cancel")) {
+        done = codex_adapter_request(cmd.id, cmd.method);
+        if (done) {
+            s_management_codex_id = cmd.id;
+            management_operation(cmd.id, cmd.method, "running", "Codex request in progress");
+            memset(&cmd, 0, sizeof(cmd));
+            return;
+        }
+        message = "Codex setup is busy or unavailable";
+    } else if (!strcmp(cmd.method, "network.test")) {
+        management_network_test();
+        oauth_management_status_t snapshot;
+        oauth_probe_get_management_status(&snapshot);
+        done = snapshot.network.https;
+        message = snapshot.network.message;
+        management_operation(cmd.id, cmd.method, done ? "done" : "failed", message);
+        memset(&cmd, 0, sizeof(cmd));
+        return;
+    } else if (!strcmp(cmd.method, "claude.begin")) {
+        bool gui_wanted;
+        taskENTER_CRITICAL(&s_settings_mux);
+        gui_wanted = s_settings_wanted_open || s_settings_committing;
+        taskEXIT_CRITICAL(&s_settings_mux);
+        if (s_manual_session || gui_wanted || atomic_load(&s_usb_session_active) ||
+            s_token_dirty || wifi_manager_is_provisioning() || !wifi_up() || !clock_valid()) {
+            message = "Claude setup is busy or network is not ready";
+        } else {
+            char challenge[48], url[sizeof(s_management.authorization_url)];
+            if (s_server) {
+                stop_setup();
+                memset(state, 0, 48);
+                memset(verifier, 0, 80);
+            }
+            done = encode_random(s_usb_oauth.verifier, sizeof(s_usb_oauth.verifier), 32) &&
+                   encode_random(s_usb_oauth.state, sizeof(s_usb_oauth.state), 24) &&
+                   pkce_challenge(s_usb_oauth.verifier, challenge, sizeof(challenge)) &&
+                   authorization_url(url, sizeof(url), challenge, s_usb_oauth.state);
+            if (done) {
+                s_usb_oauth.deadline_us = esp_timer_get_time() + CAP_LIFETIME_SEC * 1000000LL;
+                atomic_store(&s_usb_session_active, true);
+                management_account(atomic_load(&s_token_configured), "awaiting_code",
+                                   s_usb_oauth.state, url);
+                claude_status("OAuth", "Complete sign-in in browser");
+                message = "Open authorization URL in a new tab";
+            } else {
+                usb_oauth_clear(*have_token);
+                message = "Could not start Claude sign-in";
+            }
+        }
+    } else if (!strcmp(cmd.method, "claude.submit_code")) {
+        if (!atomic_load(&s_usb_session_active) ||
+            esp_timer_get_time() >= s_usb_oauth.deadline_us ||
+            strcmp(cmd.arg1, s_usb_oauth.state) || !wifi_up() || !clock_valid() ||
+            wifi_manager_is_provisioning()) {
+            message = "Sign-in session expired or network unavailable";
+        } else {
+            char *code = NULL;
+            if (!probe_authorization_code(cmd.arg2, s_usb_oauth.state, &code)) {
+                message = "Code or state does not match";
+            } else {
+                token_store_t *candidate = calloc(1, sizeof(*candidate));
+                bool exchanged = candidate && exchange_code(code, s_usb_oauth.state,
+                                                             s_usb_oauth.verifier, candidate);
+                if (exchanged && wifi_up() && !wifi_manager_is_provisioning() &&
+                    esp_timer_get_time() < s_usb_oauth.deadline_us && save_token(candidate)) {
+                    *token = *candidate;
+                    *have_token = true;
+                    atomic_store(&s_usage_validated, false);
+                    s_token_dirty = false;
+                    *next_usage = 0;
+                    *next_refresh = 0;
+                    *usage_retry_until = 0;
+                    *failures = 0;
+                    *first_usage = true;
+                    reset_claude_usage(true, "Checking new account");
+                    usb_oauth_clear(true);
+                    done = true;
+                    message = "Claude account saved; checking usage";
+                } else message = exchanged ? "Could not save sign-in" : "Code exchange failed";
+                if (candidate) { memset(candidate, 0, sizeof(*candidate)); free(candidate); }
+            }
+        }
+    } else if (!strcmp(cmd.method, "claude.cancel")) {
+        usb_oauth_clear(atomic_load(&s_token_configured));
+        done = true;
+        message = "Claude sign-in cancelled";
+    }
+    management_operation(cmd.id, cmd.method, done ? "done" : "failed", message);
+    memset(&cmd, 0, sizeof(cmd));
+}
+
 static void worker(void *arg)
 {
     (void)arg;
     token_store_t *token = calloc(1, sizeof(*token));
-    if (!token) { display_status("OAuth error", "Out of memory"); vTaskDelete(NULL); return; }
+    if (!token) { claude_status("OAuth error", "Out of memory"); vTaskDelete(NULL); return; }
     bool have_token = load_token(token);
     bool clock_announced = false;
     bool first_usage = true;
     int64_t next_usage = 0, next_refresh = 0, usage_retry_until = 0;
     int failures = 0;
     char state[48] = {0}, verifier[80] = {0};
+    management_account(have_token, have_token ? "configured" : "not_configured", "", "");
+    provider_usage_t initial = {0};
+    initial.configured = have_token;
+    publish_claude_usage(&initial);
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
     esp_sntp_set_time_sync_notification_cb(on_time_sync);
     esp_sntp_init();
     for (;;) {
+        if (atomic_load(&s_usb_session_active) &&
+            esp_timer_get_time() >= s_usb_oauth.deadline_us)
+            usb_oauth_clear(atomic_load(&s_token_configured));
+        process_management(token, &have_token, state, verifier, &next_usage,
+                           &next_refresh, &usage_retry_until, &failures, &first_usage);
+        management_poll_wifi();
+        management_poll_codex();
         expire_reset_confirmation();
         process_factory_reset(token, state, verifier);
         process_forget(state, verifier);
@@ -1033,6 +1538,7 @@ static void worker(void *arg)
          * worker's polling interval. Fetch immediately; animate at request start. */
         if (xEventGroupClearBits(s_wifi_events, OAUTH_WIFI_RECONNECTED) & OAUTH_WIFI_RECONNECTED) {
             next_usage = 0;
+            management_network_invalidate("Network changed; run test again");
         }
         if (!clock_valid()) {
             publish_refresh(false, 0);
@@ -1042,7 +1548,7 @@ static void worker(void *arg)
             continue;
         }
         if (!clock_announced) {
-            setenv("TZ", "CET-1CEST,M3.5.0/2,M10.5.0/3", 1);
+            setenv("TZ", box_config_timezone(), 1);
             tzset();
             display_clock_ready();
             ESP_LOGI(TAG, "SNTP time ready");
@@ -1052,7 +1558,7 @@ static void worker(void *arg)
         if (have_token && s_token_dirty) {
             publish_refresh(false, 0);
             if (!save_token(token)) {
-                display_status("Storage error", "Saving sign-in; retrying");
+                claude_status("Storage error", "Saving sign-in; retrying");
                 vTaskDelay(pdMS_TO_TICKS(5000));
                 continue;
             }
@@ -1061,10 +1567,19 @@ static void worker(void *arg)
         }
         if (!have_token) {
             publish_refresh(false, 0);
+            if (codex_selected() && !s_manual_session &&
+                !atomic_load(&s_usb_session_active)) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+                continue;
+            }
+            if (atomic_load(&s_usb_session_active)) {
+                ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(250));
+                continue;
+            }
             if (!s_server || now_s() >= s_cap_deadline) {
                 if (s_server) stop_setup();
                 if (!start_setup(state, verifier, false, 0)) {
-                    display_status("Setup error", "Local setup page unavailable");
+                    claude_status("Setup error", "Local setup page unavailable");
                     vTaskDelay(pdMS_TO_TICKS(5000));
                     continue;
                 }
@@ -1079,7 +1594,7 @@ static void worker(void *arg)
                 if (!probe_authorization_code(item.code, state, &code)) {
                     set_page_state("Paste the full code with the matching #state");
                     s_auto_qr_visible = false;
-                    display_status("OAuth error", "Code or state does not match");
+                    claude_status("OAuth error", "Code or state does not match");
                     memset(&item, 0, sizeof(item));
                     continue;
                 }
@@ -1087,7 +1602,7 @@ static void worker(void *arg)
                     set_page_state("Invalid code or setup page expired");
                 } else {
                     s_auto_qr_visible = false;
-                    display_status("OAuth", "Checking code");
+                    claude_status("OAuth", "Checking code");
                     token_store_t *candidate = calloc(1, sizeof(*candidate));
                     bool valid = candidate && exchange_code(code, state, verifier, candidate);
                     if (valid && item.session == s_session && s_cap_valid &&
@@ -1096,11 +1611,13 @@ static void worker(void *arg)
                         s_token_dirty = !save_token(token);
                         if (s_token_dirty) ESP_LOGE(TAG, "New OAuth credential pending NVS persistence");
                         have_token = true;
+                        atomic_store(&s_usage_validated, false);
+                        reset_claude_usage(true, "Checking new account");
                     }
                     if (candidate) { memset(candidate, 0, sizeof(*candidate)); free(candidate); }
                     if (have_token) {
                         stop_setup();
-                        display_status("OAuth", s_token_dirty ? "Token received; saving" : "Token saved; checking usage");
+                        claude_status("OAuth", s_token_dirty ? "Token received; saving" : "Token saved; checking usage");
                         memset(verifier, 0, sizeof(verifier));
                         memset(state, 0, sizeof(state));
                         first_usage = true;
@@ -1109,7 +1626,7 @@ static void worker(void *arg)
                         failures = 0;
                     } else {
                         set_page_state("Check failed; use a new sign-in code");
-                        display_status("OAuth error", "Code check failed");
+                        claude_status("OAuth error", "Code check failed");
                     }
                 }
                 memset(&item, 0, sizeof(item));
@@ -1135,11 +1652,13 @@ static void worker(void *arg)
                             if (saved) {
                                 *token = *candidate;
                                 s_token_dirty = false;
+                                atomic_store(&s_usage_validated, false);
                                 first_usage = true;
                                 next_usage = 0;
                                 usage_retry_until = 0;
                                 next_refresh = 0;
                                 failures = 0;
+                                reset_claude_usage(true, "Checking new account");
                             }
                             finish_settings_commit();
                             if (saved) {
@@ -1160,6 +1679,11 @@ static void worker(void *arg)
                 memset(&item, 0, sizeof(item));
             }
         }
+        if (!claude_selected()) {
+            publish_refresh(false, 0);
+            ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
+            continue;
+        }
         int64_t now = now_s();
         int64_t retry_gate = usage_retry_until;
         if (now >= token->expires_at - 60 && next_refresh > retry_gate)
@@ -1169,11 +1693,12 @@ static void worker(void *arg)
         bool usage_due = refresh_control_usage_due(now, next_usage, usage_retry_until,
                                                    token->expires_at);
         bool manual = false;
-        bool cycle = begin_refresh(refresh_due || usage_due, &manual);
+        uint32_t cycle_generation = 0;
+        bool cycle = begin_refresh(refresh_due || usage_due, &manual, &cycle_generation);
         if (manual) next_usage = 0;
         if (cycle && now >= token->expires_at - 60 && now >= next_refresh) {
             int retry_after = 0;
-            display_status("OAuth", "Refreshing token");
+            claude_status("OAuth", "Refreshing token");
             ESP_LOGI(TAG, "REFRESH_TEST automatic attempt at %lld; expiry %lld",
                      (long long)now, (long long)token->expires_at);
             refresh_result_t result = refresh(token, &retry_after);
@@ -1182,7 +1707,7 @@ static void worker(void *arg)
                 have_token = false;
                 memset(token, 0, sizeof(*token));
                 next_refresh = 0;
-                end_refresh(false, 0);
+                end_refresh(false, 0, cycle_generation);
                 continue;
             }
             if (result == REFRESH_OK) {
@@ -1192,11 +1717,14 @@ static void worker(void *arg)
             } else {
                 next_refresh = now_s() + refresh_control_retry_delay(++failures, retry_after);
                 if (next_usage < next_refresh) next_usage = next_refresh;
-                display_status("OAuth", "Token refresh failed; retrying");
+                claude_status("OAuth", "Token refresh failed; retrying");
             }
         }
         if (s_token_dirty) {
-            if (cycle) end_refresh(false, 0);
+            if (cycle) {
+                claude_status("Storage error", "Saving sign-in; retrying");
+                end_refresh(false, 0, cycle_generation);
+            }
             continue;
         }
         now = now_s();
@@ -1208,8 +1736,8 @@ static void worker(void *arg)
                 if (now_s() < next_refresh) {
                     next_usage = next_refresh;
                     usage_retry_until = next_refresh;
-                    display_status("Usage", "Retrying after cooldown");
-                    end_refresh(true, next_refresh);
+                    claude_status("Usage", "Retrying after cooldown");
+                    end_refresh(true, next_refresh, cycle_generation);
                     continue;
                 }
                 ESP_LOGI(TAG, "REFRESH_TEST usage 401 attempt at %lld", (long long)now_s());
@@ -1219,7 +1747,7 @@ static void worker(void *arg)
                     have_token = false;
                     memset(token, 0, sizeof(*token));
                     next_refresh = 0;
-                    end_refresh(false, 0);
+                    end_refresh(false, 0, cycle_generation);
                     continue;
                 }
                 if (result == REFRESH_OK && !s_token_dirty) {
@@ -1232,6 +1760,7 @@ static void worker(void *arg)
                 }
             }
             if (status == 200 && wifi_up()) {
+                atomic_store(&s_usage_validated, true);
                 if (first_usage) {
                     stop_setup();
                     first_usage = false;
@@ -1239,9 +1768,9 @@ static void worker(void *arg)
                 }
                 failures = 0;
                 usage_retry_until = 0;
-                next_usage = now_s() + 300;
+                next_usage = now_s() + box_config_current()->refresh_interval_sec;
             } else {
-                if (wifi_up()) display_status("Usage", "Usage check failed; retrying");
+                if (wifi_up()) claude_status("Usage", "Usage check failed; retrying");
                 else display_status("Wi-Fi", "Waiting for connection");
                 next_usage = now_s() +
                              refresh_control_usage_retry_delay(++failures, status, retry_after);
@@ -1253,7 +1782,8 @@ static void worker(void *arg)
             retry_gate = usage_retry_until;
             if (now >= token->expires_at - 60 && next_refresh > retry_gate)
                 retry_gate = next_refresh;
-            end_refresh(have_token && !s_token_dirty && wifi_up() && clock_valid(), retry_gate);
+            end_refresh(have_token && !s_token_dirty && wifi_up() && clock_valid(), retry_gate,
+                        cycle_generation);
         }
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000));
     }
@@ -1267,12 +1797,15 @@ void oauth_probe_start(EventGroupHandle_t wifi_events, esp_netif_t *sta)
     s_settings_commands = xQueueCreate(1, sizeof(settings_command_t));
     s_forget_commands = xQueueCreate(1, sizeof(uint32_t));
     s_reset_commands = xQueueCreate(1, sizeof(reset_command_t));
+    s_management_commands = xQueueCreate(1, sizeof(management_command_t));
     s_cap_lock = xSemaphoreCreateMutex();
-    if (!s_submissions || !s_settings_commands || !s_forget_commands || !s_reset_commands || !s_cap_lock ||
+    if (!s_submissions || !s_settings_commands || !s_forget_commands || !s_reset_commands ||
+        !s_management_commands || !s_cap_lock ||
         xTaskCreate(worker, "oauth_probe", 12288, NULL, 5, &s_worker_task) != pdPASS)
-        display_status("OAuth error", "Service could not start");
+        claude_status("OAuth error", "Service could not start");
     else {
         display_set_refresh_callback(request_manual_refresh, NULL);
+        display_set_app_refresh_callback(request_app_refresh, NULL);
         display_set_settings_callback(request_settings, NULL);
     }
 }

@@ -15,6 +15,12 @@ const char *const word_clock_rows[WORD_CLOCK_ROWS] = {
     "ZEHNEUNKUHR",
 };
 
+const char *const word_clock_english_rows[WORD_CLOCK_ROWS] = {
+    "ITLISASTIME", "ACQUARTERDC", "TWENTYFIVEX", "HALFBTENFTO",
+    "PASTERUNINE", "ONESIXTHREE", "FOURFIVETWO", "EIGHTELEVEN",
+    "SEVENTWELVE", "TENSEOCLOCK",
+};
+
 typedef struct {
     uint8_t row;
     uint8_t column;
@@ -110,4 +116,55 @@ void word_clock_compute(int hour, int minute, bool ready, word_clock_state_t *ou
     if (shown_hour == 0) shown_hour = 12;
     activate(out, five_minute_slot == 0 && shown_hour == 1
                       ? WORD_EIN : HOUR_WORDS[shown_hour]);
+}
+
+const char *const *word_clock_rows_for_language(uint8_t language)
+{
+    return language == WORD_CLOCK_ENGLISH ? word_clock_english_rows : word_clock_rows;
+}
+
+void word_clock_compute_language(int hour, int minute, bool ready,
+                                 uint8_t language, word_clock_state_t *out)
+{
+    if (language != WORD_CLOCK_ENGLISH) {
+        word_clock_compute(hour, minute, ready, out);
+        return;
+    }
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    if (!ready || hour < 0 || hour > 23 || minute < 0 || minute > 59) return;
+
+    static const word_span_t words[] = {
+        {2, 6, 4}, /* FIVE */ {3, 5, 3}, /* TEN */
+        {1, 2, 7}, /* QUARTER */ {2, 0, 6}, /* TWENTY */
+        {3, 0, 4}, /* HALF */
+    };
+    static const word_span_t hours[13] = {
+        {0, 0, 0}, {5, 0, 3}, {6, 8, 3}, {5, 6, 5},
+        {6, 0, 4}, {6, 4, 4}, {5, 3, 3}, {8, 0, 5},
+        {7, 0, 5}, {4, 7, 4}, {9, 0, 3}, {7, 5, 6},
+        {8, 5, 6},
+    };
+    out->valid = true;
+    out->minute_dots = (uint8_t)(minute % 5);
+    activate(out, (word_span_t){0, 0, 2}); /* IT */
+    activate(out, (word_span_t){0, 3, 2}); /* IS */
+    int slot = minute / 5;
+    if (slot == 0) {
+        activate(out, (word_span_t){9, 5, 6}); /* OCLOCK */
+    } else {
+        if (slot == 1 || slot == 5 || slot == 7 || slot == 11) activate(out, words[0]);
+        if (slot == 2 || slot == 10) activate(out, words[1]);
+        if (slot == 3 || slot == 9) {
+            activate(out, (word_span_t){1, 0, 1}); /* A */
+            activate(out, words[2]);
+        }
+        if (slot == 4 || slot == 5 || slot == 7 || slot == 8) activate(out, words[3]);
+        if (slot == 6) activate(out, words[4]);
+        if (slot >= 1 && slot <= 6) activate(out, (word_span_t){4, 0, 4}); /* PAST */
+        else activate(out, (word_span_t){3, 9, 2}); /* TO */
+    }
+    int shown_hour = (hour + (slot >= 7)) % 12;
+    if (shown_hour == 0) shown_hour = 12;
+    activate(out, hours[shown_hour]);
 }

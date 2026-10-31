@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "version": "0.19.4-codex-headers",
+  "chipFamily": "ESP32-S3",
+  "flashSize": 8388608,
+  "configuration": {
+    "offset": 7667712,
+    "size": 4096,
+    "magic": "HBX1",
+    "payloadSize": 108
+  },
+  "parts": [
+    {
+      "kind": "bootloader",
+      "path": "/firmware/bootloader.bin",
+      "offset": 0,
+      "size": 22432,
+      "sha256": "81d29ed0997276bf93d3fda9b5c42e44047a73963c585a125c2de0fa1ffe045d"
+    },
+    {
+      "kind": "partitions",
+      "path": "/firmware/partitions.bin",
+      "offset": 32768,
+      "size": 3072,
+      "sha256": "12c9ea8b95dbcf73610bc44a5ba1f09388a355be2d68f28f90338635d89be029"
+    },
+    {
+      "kind": "app",
+      "path": "/firmware/hello-box.bin",
+      "offset": 65536,
+      "size": 1511264,
+      "sha256": "069b0b669770a5b818c2505081d29db209bc5d53482e140fcec72501e61a8234"
+    }
+  ]
+}

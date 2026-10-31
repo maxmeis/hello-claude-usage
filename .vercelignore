@@ -1,0 +1,8 @@
+*
+!web-installer/
+!web-installer/**
+web-installer/node_modules/
+web-installer/dist/
+web-installer/.vercel/
+web-installer/.env*
+web-installer/test/

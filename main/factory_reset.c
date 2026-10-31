@@ -3,8 +3,10 @@
 #include <stdint.h>
 
 #include "nvs.h"
+#include "nvs_flash.h"
 
 #include "wifi_store.h"
+#include "box_config_store.h"
 
 #define RESET_NAMESPACE "factory_reset"
 #define RESET_KEY "pending"
@@ -64,7 +66,13 @@ esp_err_t factory_reset_prepare_boot(void)
 
     err = erase_app_namespace("claude_probe");
     if (err != ESP_OK) return err;
+    /* Codex credentials live in the dedicated provider-accounts partition.
+     * Erase it only while the durable reset journal is pending. */
+    err = nvs_flash_erase_partition("quota_accounts");
+    if (err != ESP_OK && err != ESP_ERR_NOT_FOUND) return err;
     err = erase_app_namespace("hello_box");
+    if (err != ESP_OK) return err;
+    err = box_config_factory_erase();
     if (err != ESP_OK) return err;
 
     wifi_store_record_t forgotten = {.state = WIFI_STORE_FORGOTTEN};

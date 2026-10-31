@@ -480,7 +480,7 @@ class DeviceDiscoveryTests(unittest.TestCase):
         )) + "\n\n" + c_function(wifi, "static void refresh_setup_url(")
         worker = c_function(wifi, "static void worker(")
         self.assertIn("refresh_setup_url(now);", worker)
-        self.assertIn("pdMS_TO_TICKS(1000)", worker)
+        self.assertIn("pdMS_TO_TICKS(s_manager.tx_retry_pending ? 100 : 1000)", worker)
         self.run_refresh_harness(REFRESH_COMMON +
                                  WIFI_REFRESH_HARNESS.replace("__PRODUCTION__", production))
 

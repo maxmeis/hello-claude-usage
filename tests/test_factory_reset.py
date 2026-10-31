@@ -17,6 +17,15 @@ typedef int esp_err_t;
 #define ESP_ERR_INVALID_ARG 0x102
 #define ESP_ERR_INVALID_STATE 0x103
 #define ESP_ERR_NVS_NOT_FOUND 0x1102
+#define ESP_ERR_NOT_FOUND 0x105
+#endif
+'''
+
+NVS_FLASH = r'''
+#ifndef NVS_FLASH_H
+#define NVS_FLASH_H
+#include "esp_err.h"
+esp_err_t nvs_flash_erase_partition(const char *partition_label);
 #endif
 '''
 
@@ -49,12 +58,16 @@ HARNESS = r'''
 #include "factory_reset.h"
 #include "wifi_store.h"
 #include "nvs.h"
+#include "nvs_flash.h"
 
 enum { RESET, CLAUDE, IDENTITY, WIFI, OTHER, COUNT };
 static const char *names[] = {"factory_reset", "claude_probe", "hello_box", "wifi_app", "sdk_other"};
 typedef struct { bool present; bool key; uint8_t data[160]; size_t size; } ns_t;
 static ns_t durable[COUNT], staged[COUNT];
 static int mutation, fail_at, erase_calls;
+static int config_erase_calls;
+static int accounts_partition_erase_calls;
+static bool accounts_partition_present;
 static bool journal_read_fails;
 
 static bool fail_now(void) { return fail_at && ++mutation == fail_at; }
@@ -76,11 +89,27 @@ static void seed(int i, uint8_t value) {
 }
 static void seed_settings(void) {
     memset(durable, 0, sizeof(durable)); reboot();
+    accounts_partition_present = true;
     seed(CLAUDE, 42); seed(IDENTITY, 43); seed(OTHER, 44);
     wifi_store_record_t wifi = {.state = WIFI_STORE_CONFIGURED};
     strcpy(wifi.ssid, "old-network"); strcpy(wifi.password, "old-password");
     assert(wifi_store_save(&wifi) == ESP_OK);
-    reboot(); erase_calls = 0;
+    reboot(); erase_calls = config_erase_calls = 0;
+    accounts_partition_erase_calls = 0;
+}
+
+esp_err_t box_config_factory_erase(void) {
+    ++config_erase_calls;
+    return ESP_OK;
+}
+
+esp_err_t nvs_flash_erase_partition(const char *partition_label) {
+    assert(!strcmp(partition_label, "quota_accounts"));
+    ++accounts_partition_erase_calls;
+    if (fail_now()) return ESP_FAIL;
+    if (!accounts_partition_present) return ESP_ERR_NOT_FOUND;
+    accounts_partition_present = false;
+    return ESP_OK;
 }
 
 esp_err_t nvs_open(const char *name, int mode, nvs_handle_t *handle) {
@@ -139,6 +168,9 @@ static void assert_pending(bool expected) {
     assert(factory_reset_is_pending(&pending) == ESP_OK && pending == expected);
 }
 static void assert_reset_state(void) {
+    assert(config_erase_calls > 0);
+    assert(accounts_partition_erase_calls > 0);
+    assert(!accounts_partition_present);
     assert(!durable[CLAUDE].key && !durable[IDENTITY].key);
     assert(durable[OTHER].key && durable[OTHER].data[0] == 44);
     wifi_store_record_t wifi;
@@ -151,6 +183,7 @@ int main(void) {
     seed_settings();
     assert_pending(false);
     assert(factory_reset_prepare_boot() == ESP_OK && erase_calls == 0);
+    assert(accounts_partition_erase_calls == 0); /* No reset, no account erase. */
     assert(factory_reset_complete() == ESP_OK && erase_calls == 0);
     assert(factory_reset_is_pending(NULL) == ESP_ERR_INVALID_ARG);
 
@@ -160,6 +193,7 @@ int main(void) {
         assert(factory_reset_request() == ESP_FAIL);
         reboot(); assert_pending(false);
         assert(factory_reset_prepare_boot() == ESP_OK && erase_calls == 0);
+        assert(accounts_partition_erase_calls == 0);
         assert(durable[CLAUDE].key && durable[IDENTITY].key && durable[WIFI].key);
     }
 
@@ -174,7 +208,7 @@ int main(void) {
     assert(factory_reset_request() == ESP_FAIL && erase_calls == 0);
 
     /* Every interrupted erase or write can resume from durable journal state. */
-    for (int fail = 1; fail <= 6; ++fail) {
+    for (int fail = 1; fail <= 7; ++fail) {
         seed_settings(); assert(factory_reset_request() == ESP_OK); reboot();
         assert_pending(true);
         assert(factory_reset_request() == ESP_OK && mutation == 0);
@@ -193,6 +227,22 @@ int main(void) {
     assert(factory_reset_request() == ESP_OK);
     assert(factory_reset_prepare_boot() == ESP_OK); assert_reset_state();
     assert(factory_reset_complete() == ESP_OK); assert_pending(false);
+
+    /* Older layouts may not have the dedicated account partition. */
+    seed_settings(); accounts_partition_present = false;
+    assert(factory_reset_request() == ESP_OK);
+    assert(factory_reset_prepare_boot() == ESP_OK);
+    assert(!accounts_partition_present && accounts_partition_erase_calls == 1);
+    assert(factory_reset_complete() == ESP_OK);
+
+    /* Failure to erase provider accounts retains the journal for retry. */
+    seed_settings(); assert(factory_reset_request() == ESP_OK); reboot();
+    fail_at = 2; mutation = 0; /* Claude namespace erase succeeds; account erase fails. */
+    assert(factory_reset_prepare_boot() == ESP_FAIL);
+    assert_pending(true); assert(accounts_partition_present);
+    reboot(); assert(factory_reset_prepare_boot() == ESP_OK);
+    assert_reset_state(); assert_pending(true);
+    assert(factory_reset_complete() == ESP_OK);
 
     /* Failed journal erase or commit leaves the reset pending for another boot. */
     for (int fail = 1; fail <= 2; ++fail) {
@@ -216,6 +266,7 @@ class FactoryResetTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
             (directory / "esp_err.h").write_text(ESP_ERR)
+            (directory / "nvs_flash.h").write_text(NVS_FLASH)
             (directory / "nvs.h").write_text(NVS)
             (directory / "harness.c").write_text(HARNESS)
             binary = directory / "factory_reset_test"
@@ -231,13 +282,31 @@ class FactoryResetTests(unittest.TestCase):
 
     def test_boot_and_driver_restore_order(self):
         app = (ROOT / "main" / "app_main.c").read_text()
-        wifi = (ROOT / "main" / "wifi_manager.c").read_text()
+        wifi_source = (ROOT / "main" / "wifi_manager.c").read_text()
+        wifi = wifi_source
+        reset = (ROOT / "main" / "factory_reset.c").read_text()
+        # Recovery has another start call; boot ordering belongs to startup.
+        wifi = wifi.split("esp_err_t wifi_manager_start(", 1)[1]
+        reset_boot = reset.split("esp_err_t factory_reset_prepare_boot(", 1)[1].split(
+            "esp_err_t factory_reset_complete(", 1)[0]
+        self.assertLess(reset_boot.index('erase_app_namespace("claude_probe")'),
+                        reset_boot.index('nvs_flash_erase_partition("quota_accounts")'))
+        self.assertLess(reset_boot.index('nvs_flash_erase_partition("quota_accounts")'),
+                        reset_boot.index('erase_app_namespace("hello_box")'))
         self.assertLess(app.index("nvs_flash_init()"), app.index("factory_reset_prepare_boot()"))
         self.assertLess(app.index("factory_reset_prepare_boot()"), app.index("device_identity_init()"))
+        self.assertLess(app.index("factory_reset_prepare_boot()"), app.index("box_config_init()"))
+        self.assertLess(app.index("box_config_init()"),
+                        app.index("display_init();", app.index("box_config_init()")))
         self.assertLess(wifi.index("esp_wifi_init(&init)"), wifi.index("factory_reset_is_pending(&reset_pending)"))
         self.assertLess(wifi.index("esp_wifi_restore()"), wifi.index("factory_reset_complete()"))
         self.assertLess(wifi.index("factory_reset_complete()"), wifi.index("esp_wifi_get_config("))
         self.assertLess(wifi.index("factory_reset_complete()"), wifi.index("esp_wifi_start()"))
+        forget = wifi_source.split("case CMD_FORGET:", 1)[1].split(
+            "case CMD_STA_CONNECTED:", 1)[0]
+        self.assertNotIn("nvs_flash_erase_partition", forget,
+                         "Forget Wi-Fi must retain provider account credentials")
+        self.assertNotIn("factory_reset_prepare_boot()", forget)
 
 
 if __name__ == "__main__":
